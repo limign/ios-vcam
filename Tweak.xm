@@ -19,7 +19,12 @@ static void VCamLogInit(void) {
         ];
         NSString *dir = nil;
         for (NSString *c in candidates) {
-            if ([fm createDirectoryAtPath:c withIntermediateDirectories:YES attributes:nil error:NULL]) {
+            [fm createDirectoryAtPath:c withIntermediateDirectories:YES attributes:nil error:NULL];
+            // 建得出来不代表写得进去（roothide 沙盒会拦），必须真写一个探针文件验证。
+            // 否则会选中一个只读目录，日志全部静默丢失 —— 比没有日志更难查。
+            NSString *probe = [c stringByAppendingPathComponent:@".probe"];
+            if ([@"ok" writeToFile:probe atomically:YES encoding:NSUTF8StringEncoding error:NULL]) {
+                [fm removeItemAtPath:probe error:NULL];
                 dir = c;
                 break;
             }
@@ -130,23 +135,34 @@ static NSMutableArray* g_allVideoDelegates = nil;
 static BOOL g_vcamEnabled = NO;
 static VCamOverlayWindow *g_overlayWindow = nil;
 static UIButton *g_floatButton = nil;
-static AVPlayerLayer *g_maskPlayerLayer = nil;
 static AVPlayer *g_maskPlayer = nil;
 static NSURL *g_selectedVideoUrl = nil;
+
+// 相机预览层注册表。遮罩不再盖整屏，而是贴到每个 AVCaptureVideoPreviewLayer 上：
+// 整屏遮罩有两个致命问题 —— 1) 猜不准该盖哪个 window（预览常在别的 window 上，
+// 于是「视频在放、预览没变」）；2) 把相机自己的 UI 一起盖住，按钮全点不到。
+// 贴在预览层上则天然对齐真实预览区域，且不遮挡 UI。
+static NSHashTable *g_previewLayers = nil;    // weak：AVCaptureVideoPreviewLayer
+static NSMapTable *g_previewOverlays = nil;   // weak key: 预览层 -> strong value: AVPlayerLayer
 
 static void setupFloatButton(void);
 static void handlePanGesture(UIPanGestureRecognizer *gesture);
 static void handleTapGesture(UITapGestureRecognizer *gesture);
-static void createFullScreenMask(NSURL *videoUrl);
-static void destroyMask(void);
-static void destroyMaskLocked(void);
+static void vcamStartOverlay(NSURL *videoUrl);
+static void vcamStopOverlay(void);
+static void vcamSyncPreviewOverlay(AVCaptureVideoPreviewLayer *layer);
 
 #pragma mark 兼容iOS13+ 获取前台活跃窗口（废弃keyWindow替代方案）
 static UIWindow *getActiveKeyWindow(void) {
     UIWindow *targetWin = nil;
-    for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        // connectedScenes 里不保证都是 UIWindowScene，而 -windows 只存在于 UIWindowScene。
+        // 直接对普通 UIScene 取 .windows 会是「向 UIResponder 发未实现消息」→ 未捕获异常 → SIGABRT。
+        // 崩溃日志正是这个形状：手势回调 → VCam.dylib → 消息转发 → doesNotRecognizeSelector。
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
         if (scene.activationState == UISceneActivationStateForegroundActive) {
-            for (UIWindow *win in scene.windows) {
+            UIWindowScene *winScene = (UIWindowScene *)scene;
+            for (UIWindow *win in winScene.windows) {
                 if (win.isKeyWindow && win.isHidden == NO) {
                     targetWin = win;
                     break;
@@ -158,52 +174,109 @@ static UIWindow *getActiveKeyWindow(void) {
     return targetWin;
 }
 
-static void createFullScreenMask(NSURL *videoUrl) {
+#pragma mark 预览层覆盖
+// 正在同步的标记：addSublayer / 改 frame 都会让父层重新 layout，
+// 进而再次回调 layoutSublayers，没有这个闩就会递归。
+static BOOL s_syncingPreview = NO;
+
+// 任意线程可调，内部统一切到主线程再动图层
+static void vcamSyncPreviewOverlay(AVCaptureVideoPreviewLayer *layer) {
+    if (!layer) return;
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ vcamSyncPreviewOverlay(layer); });
+        return;
+    }
+    if (s_syncingPreview) return;
+    s_syncingPreview = YES;
+
+    AVPlayerLayer *overlay = [g_previewOverlays objectForKey:layer];
+
+    if (!g_vcamEnabled || !g_maskPlayer) {
+        if (overlay) {
+            [overlay removeFromSuperlayer];
+            [g_previewOverlays removeObjectForKey:layer];
+            VCamLog(@"预览层覆盖已移除 bounds=%@", NSStringFromCGRect(layer.bounds));
+        }
+        s_syncingPreview = NO;
+        return;
+    }
+
+    if (!overlay) {
+        overlay = [AVPlayerLayer playerLayerWithPlayer:g_maskPlayer];
+        overlay.videoGravity = AVLayerVideoGravityResizeAspectFill;
+        overlay.zPosition = 1000;
+        overlay.frame = layer.bounds;
+        [layer addSublayer:overlay];
+        [g_previewOverlays setObject:overlay forKey:layer];
+        VCamLog(@"已挂上预览层覆盖 layer=%p bounds=%@", layer,
+                NSStringFromCGRect(layer.bounds));
+    } else if (!CGRectEqualToRect(overlay.frame, layer.bounds)) {
+        // 旋转 / 切前后摄 / 进画中画都会改预览层几何
+        overlay.frame = layer.bounds;
+        VCamLog(@"预览层几何已同步 bounds=%@", NSStringFromCGRect(layer.bounds));
+    }
+
+    s_syncingPreview = NO;
+}
+
+// 主线程
+static void vcamAttachToAllPreviewLayers(void) {
+    for (AVCaptureVideoPreviewLayer *l in g_previewLayers.allObjects) {
+        vcamSyncPreviewOverlay(l);
+    }
+}
+
+// 主线程。先在数组里收好键再改表，避免边遍历边删
+static void vcamDetachAllOverlays(void) {
+    NSArray *layers = g_previewOverlays.keyEnumerator.allObjects;
+    for (AVCaptureVideoPreviewLayer *l in layers) {
+        [[g_previewOverlays objectForKey:l] removeFromSuperlayer];
+        [g_previewOverlays removeObjectForKey:l];
+    }
+    if (layers.count) VCamLog(@"已移除 %lu 个预览层覆盖", (unsigned long)layers.count);
+}
+
+static void vcamStartOverlay(NSURL *videoUrl) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        // 必须用同步版本：destroyMask() 自身也要 dispatch 到 main，
-        // 在主队列 block 里调它只会把销毁「入队」，等本 block 跑完才执行，
-        // 结果把下面刚 addSublayer 的遮罩又删掉，遮罩永远不显示。
-        destroyMaskLocked();
+        vcamDetachAllOverlays();
+        if (g_maskPlayer) {
+            [g_maskPlayer pause];
+            g_maskPlayer = nil;
+        }
 
         AVPlayerItem *item = [AVPlayerItem playerItemWithURL:videoUrl];
         g_maskPlayer = [AVPlayer playerWithPlayerItem:item];
         g_maskPlayer.actionAtItemEnd = AVPlayerActionAtItemEndNone;
+
+        // 播完回到开头接着放，否则视频放到结尾就定格成一张静止画面
+        [[NSNotificationCenter defaultCenter]
+            addObserverForName:AVPlayerItemDidPlayToEndTimeNotification
+                        object:item
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) {
+            AVPlayer *p = g_maskPlayer;
+            if (p && p.currentItem == item) {
+                [p seekToTime:kCMTimeZero];
+                [p play];
+            }
+        }];
+
         [g_maskPlayer play];
-
-        g_maskPlayerLayer = [AVPlayerLayer playerLayerWithPlayer:g_maskPlayer];
-        UIWindow *keyWin = getActiveKeyWindow();
-        if (!keyWin) {
-            VCamLog(@"遮罩创建失败：getActiveKeyWindow() 返回 nil");
-            return;
-        }
-
-        g_maskPlayerLayer.frame = keyWin.bounds;
-        g_maskPlayerLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
-        g_maskPlayerLayer.zPosition = 9998;
-        [keyWin.layer addSublayer:g_maskPlayerLayer];
-        VCamLog(@"遮罩已创建 win=%@ bounds=%@ sublayers=%lu",
-                NSStringFromClass([keyWin class]),
-                NSStringFromCGRect(keyWin.bounds),
-                (unsigned long)keyWin.layer.sublayers.count);
+        vcamAttachToAllPreviewLayers();
+        VCamLog(@"视频已开播：已登记预览层 %lu 个，已挂覆盖 %lu 个",
+                (unsigned long)g_previewLayers.count,
+                (unsigned long)g_previewOverlays.count);
     });
 }
 
-// 同步销毁，调用方必须已在主线程
-static void destroyMaskLocked(void) {
-    if (g_maskPlayer) {
-        [g_maskPlayer pause];
-        g_maskPlayer = nil;
-    }
-    if (g_maskPlayerLayer) {
-        [g_maskPlayerLayer removeFromSuperlayer];
-        g_maskPlayerLayer = nil;
-    }
-}
-
-static void destroyMask(void) {
+static void vcamStopOverlay(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        destroyMaskLocked();
-        VCamLog(@"遮罩已销毁");
+        vcamDetachAllOverlays();
+        if (g_maskPlayer) {
+            [g_maskPlayer pause];
+            g_maskPlayer = nil;
+        }
+        VCamLog(@"虚拟相机已停止，覆盖层已清理");
     });
 }
 
@@ -263,15 +336,17 @@ static void handlePanGesture(UIPanGestureRecognizer *gesture) {
 
 static UIViewController *findTopViewController(void) {
     UIViewController *topVC = nil;
-    for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if (scene.activationState == UISceneActivationStateForegroundActive) {
-            for (UIWindow *w in scene.windows) {
-                if (w.isKeyWindow) {
-                    topVC = w.rootViewController;
-                    break;
-                }
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        // 同 getActiveKeyWindow：非 UIWindowScene 不能取 .windows
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        if (scene.activationState != UISceneActivationStateForegroundActive) continue;
+        for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+            if (w.isKeyWindow) {
+                topVC = w.rootViewController;
+                break;
             }
         }
+        if (topVC) break;
     }
     while (topVC && topVC.presentedViewController) {
         topVC = topVC.presentedViewController;
@@ -297,7 +372,7 @@ static UIViewController *findTopViewController(void) {
         dispatch_async(dispatch_get_main_queue(), ^{
             g_vcamEnabled = YES;
             [[MediaManager sharedManager] start];
-            createFullScreenMask(srcUrl);
+            vcamStartOverlay(srcUrl);
             if (g_floatButton) g_floatButton.backgroundColor = [UIColor colorWithRed:0.2 green:0.8 blue:0.4 alpha:0.9];
             VCamLog(@"视频已加载，虚拟相机开启");
         });
@@ -338,13 +413,13 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
         if (g_vcamEnabled) {
             [[MediaManager sharedManager] start];
             if (g_selectedVideoUrl) {
-                createFullScreenMask(g_selectedVideoUrl);
+                vcamStartOverlay(g_selectedVideoUrl);
             } else {
-                VCamLog(@"已开启，但还没选过视频，遮罩不会出现");
+                VCamLog(@"已开启，但还没选过视频，预览不会被替换");
             }
         } else {
             [[MediaManager sharedManager] stop];
-            destroyMask();
+            vcamStopOverlay();
         }
         VCamLog(@"虚拟相机开关切换：%d", g_vcamEnabled);
     }]];
@@ -402,6 +477,23 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
 %hook AVCapturePhotoOutput
 - (void)capturePhotoWithSettings:(AVCapturePhotoSettings *)settings delegate:(id<AVCapturePhotoCaptureDelegate>)delegate { %orig; }
 %end
+
+// 相机预览层：系统相机、微信视频通话等一切「把摄像头画面显示出来」的地方都经过它。
+// 覆盖层贴在这里，替换的才是真正的预览区域 —— 而不是盲猜一个 window 去盖整屏。
+%hook AVCaptureVideoPreviewLayer
+- (void)setSession:(AVCaptureSession *)session {
+    %orig;
+    if (!g_previewLayers) g_previewLayers = [NSHashTable weakObjectsHashTable];
+    [g_previewLayers addObject:self];
+    VCamLog(@"登记相机预览层 %p session=%p", self, session);
+    vcamSyncPreviewOverlay(self);
+}
+- (void)layoutSublayers {
+    %orig;
+    // 旋转 / 改变尺寸 / 切前后摄都会触发，用来把覆盖层几何同步过去
+    vcamSyncPreviewOverlay(self);
+}
+%end
 %end
 
 #pragma mark 入口构造函数
@@ -410,6 +502,9 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
         g_pickerDelegate = [[VCamImagePickerControllerDelegate alloc] init];
         g_allVideoDelegates = nil;
         g_selectedVideoUrl = nil;
+        // weak 持有预览层，避免拦住它的释放；覆盖层由我们强持有，预览层没了就跟着回收
+        g_previewLayers = [NSHashTable weakObjectsHashTable];
+        g_previewOverlays = [NSMapTable weakToStrongObjectsMapTable];
 
         NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
         BOOL isSpringBoard = [bundleID isEqualToString:@"com.apple.springboard"];
