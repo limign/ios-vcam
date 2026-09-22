@@ -1,5 +1,9 @@
 name: Build VCam
 
+# 发布 Release 资产需要写权限（仓库是 public，资产可匿名下载，方便设备直接 curl）
+permissions:
+  contents: write
+
 on:
   push:
     branches: [ main ]
@@ -95,3 +99,19 @@ jobs:
         name: VCam-deb
         path: output/*.deb
         retention-days: 30
+
+    # 固定 tag "latest"，每次 push 覆盖同一个 Release，避免堆积 tag。
+    # 设备侧可直接下载（无需登录）：
+    #   curl -L https://github.com/limign/ios-vcam/releases/download/latest/<deb文件名>
+    - name: Publish release asset
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: latest
+        name: Latest build
+        body: |
+          自动构建产物 —— roothide 包（Architecture: iphoneos-arm64e）
+
+          - commit: `${{ github.sha }}`
+          - 仅适用于 roothide 越狱（Dopamine-roothide / roothide Bootstrap）
+        files: output/*.deb
+        make_latest: true

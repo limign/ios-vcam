@@ -1,0 +1,14 @@
+# 本地开发辅助脚本（内含测试设备凭据），禁止提交
+.dev/
+
+# Theos 构建产物
+.theos/
+packages/
+obj/
+*.deb
+*.dylib
+*.o
+
+# macOS / 编辑器
+.DS_Store
+*.swp

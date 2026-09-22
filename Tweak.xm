@@ -5,9 +5,87 @@
 #import <substrate.h>
 #import "MediaManager.h"
 
+#pragma mark 日志（设备无 syslog，状态只能写文件后远程读）
+static NSString *g_logPath = nil;
+
+static void VCamLogInit(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        // 优先共享目录；沙盒里不可写时退回本 App 容器 tmp（必然可写，但仅本进程可见）
+        NSArray<NSString *> *candidates = @[
+            @"/var/jb/var/mobile/Library/VCam",
+            [NSTemporaryDirectory() stringByAppendingPathComponent:@"VCam"],
+        ];
+        NSString *dir = nil;
+        for (NSString *c in candidates) {
+            if ([fm createDirectoryAtPath:c withIntermediateDirectories:YES attributes:nil error:NULL]) {
+                dir = c;
+                break;
+            }
+        }
+        if (!dir) dir = NSTemporaryDirectory();
+
+        NSString *proc = [[NSProcessInfo processInfo] processName] ?: @"unknown";
+        g_logPath = [dir stringByAppendingPathComponent:
+                     [NSString stringWithFormat:@"%@.log", proc]];
+    });
+}
+
+static void VCamLog(NSString *format, ...) {
+    va_list ap;
+    va_start(ap, format);
+    NSString *msg = [[NSString alloc] initWithFormat:format arguments:ap];
+    va_end(ap);
+
+    NSLog(@"[VCam] %@", msg);
+
+    VCamLogInit();
+    if (!g_logPath) return;
+
+    @autoreleasepool {
+        NSDateFormatter *df = [[NSDateFormatter alloc] init];
+        df.dateFormat = @"HH:mm:ss.SSS";
+        NSString *line = [NSString stringWithFormat:@"%@ %@\n",
+                          [df stringFromDate:[NSDate date]], msg];
+
+        @synchronized (g_logPath) {
+            NSFileManager *fm = [NSFileManager defaultManager];
+            if (![fm fileExistsAtPath:g_logPath]) {
+                [line writeToFile:g_logPath atomically:YES
+                         encoding:NSUTF8StringEncoding error:NULL];
+                return;
+            }
+            // 控制体积：超过 256KB 只保留尾部
+            NSDictionary *attr = [fm attributesOfItemAtPath:g_logPath error:NULL];
+            if ([attr fileSize] > 256 * 1024) {
+                NSString *old = [NSString stringWithContentsOfFile:g_logPath
+                                                          encoding:NSUTF8StringEncoding
+                                                             error:NULL];
+                if (old.length > 64 * 1024) {
+                    NSString *tail = [old substringFromIndex:old.length - 64 * 1024];
+                    NSRange nl = [tail rangeOfString:@"\n"];
+                    if (nl.location != NSNotFound) {
+                        tail = [tail substringFromIndex:nl.location + 1];
+                    }
+                    [tail writeToFile:g_logPath atomically:YES
+                             encoding:NSUTF8StringEncoding error:NULL];
+                }
+            }
+            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:g_logPath];
+            if (!fh) return;
+            @try {
+                [fh seekToEndOfFile];
+                [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+            } @finally {
+                [fh closeFile];
+            }
+        }
+    }
+}
+
 #pragma mark 悬浮穿透窗口 前置定义解决类型未识别报错
 @interface VCamOverlayWindow : UIWindow
-@property (nonatomic, assign) BOOL isShowingAlert;
 @end
 @implementation VCamOverlayWindow
 - (BOOL)isPointHitButtonArea:(CGPoint)point {
@@ -19,10 +97,13 @@
     }
     return NO;
 }
+// 除悬浮球以外的区域必须完全穿透，否则会吞掉整个 App 的点击。
+// 关键：绝不能返回 self —— UIView.hitTest 在子视图都没命中时会兜底返回 self，
+// 那样 overlay window 自身就成了命中视图，全屏拦截触摸（相机按钮点不动的根因）。
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    if (self.isShowingAlert) return [super hitTest:point withEvent:event];
     if (![self isPointHitButtonArea:point]) return nil;
-    return [super hitTest:point withEvent:event];
+    UIView *hit = [super hitTest:point withEvent:event];
+    return (hit == self) ? nil : hit;
 }
 @end
 
@@ -57,7 +138,8 @@ static void setupFloatButton(void);
 static void handlePanGesture(UIPanGestureRecognizer *gesture);
 static void handleTapGesture(UITapGestureRecognizer *gesture);
 static void createFullScreenMask(NSURL *videoUrl);
-static void destroyMask();
+static void destroyMask(void);
+static void destroyMaskLocked(void);
 
 #pragma mark 兼容iOS13+ 获取前台活跃窗口（废弃keyWindow替代方案）
 static UIWindow *getActiveKeyWindow(void) {
@@ -78,34 +160,50 @@ static UIWindow *getActiveKeyWindow(void) {
 
 static void createFullScreenMask(NSURL *videoUrl) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        destroyMask();
+        // 必须用同步版本：destroyMask() 自身也要 dispatch 到 main，
+        // 在主队列 block 里调它只会把销毁「入队」，等本 block 跑完才执行，
+        // 结果把下面刚 addSublayer 的遮罩又删掉，遮罩永远不显示。
+        destroyMaskLocked();
+
         AVPlayerItem *item = [AVPlayerItem playerItemWithURL:videoUrl];
         g_maskPlayer = [AVPlayer playerWithPlayerItem:item];
         g_maskPlayer.actionAtItemEnd = AVPlayerActionAtItemEndNone;
         [g_maskPlayer play];
-        
+
         g_maskPlayerLayer = [AVPlayerLayer playerLayerWithPlayer:g_maskPlayer];
         UIWindow *keyWin = getActiveKeyWindow();
-        if (!keyWin) return;
-        
+        if (!keyWin) {
+            VCamLog(@"遮罩创建失败：getActiveKeyWindow() 返回 nil");
+            return;
+        }
+
         g_maskPlayerLayer.frame = keyWin.bounds;
         g_maskPlayerLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
         g_maskPlayerLayer.zPosition = 9998;
         [keyWin.layer addSublayer:g_maskPlayerLayer];
-        NSLog(@"[VCam] 全屏视频遮罩创建完成，覆盖相机预览");
+        VCamLog(@"遮罩已创建 win=%@ bounds=%@ sublayers=%lu",
+                NSStringFromClass([keyWin class]),
+                NSStringFromCGRect(keyWin.bounds),
+                (unsigned long)keyWin.layer.sublayers.count);
     });
 }
 
-static void destroyMask() {
+// 同步销毁，调用方必须已在主线程
+static void destroyMaskLocked(void) {
+    if (g_maskPlayer) {
+        [g_maskPlayer pause];
+        g_maskPlayer = nil;
+    }
+    if (g_maskPlayerLayer) {
+        [g_maskPlayerLayer removeFromSuperlayer];
+        g_maskPlayerLayer = nil;
+    }
+}
+
+static void destroyMask(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (g_maskPlayer) {
-            [g_maskPlayer pause];
-            g_maskPlayer = nil;
-        }
-        if (g_maskPlayerLayer) {
-            [g_maskPlayerLayer removeFromSuperlayer];
-            g_maskPlayerLayer = nil;
-        }
+        destroyMaskLocked();
+        VCamLog(@"遮罩已销毁");
     });
 }
 
@@ -135,7 +233,6 @@ static void setupFloatButton() {
 
     g_overlayWindow = [[VCamOverlayWindow alloc] initWithFrame:screen];
     g_overlayWindow.windowLevel = UIWindowLevelStatusBar - 1;
-    g_overlayWindow.isShowingAlert = NO;
     g_overlayWindow.hidden = NO;
     g_overlayWindow.backgroundColor = [UIColor clearColor];
 
@@ -190,9 +287,10 @@ static UIViewController *findTopViewController(void) {
     [picker dismissViewControllerAnimated:YES completion:nil];
     NSURL *srcUrl = info[UIImagePickerControllerMediaURL];
     if (!srcUrl) {
-        NSLog(@"[VCam] 未选择视频文件");
+        VCamLog(@"相册回调里没有视频 URL，取消");
         return;
     }
+    VCamLog(@"已选中视频 url=%@", srcUrl.path);
     g_selectedVideoUrl = srcUrl;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
         [[MediaManager sharedManager] loadMediaFromURL:srcUrl];
@@ -201,7 +299,7 @@ static UIViewController *findTopViewController(void) {
             [[MediaManager sharedManager] start];
             createFullScreenMask(srcUrl);
             if (g_floatButton) g_floatButton.backgroundColor = [UIColor colorWithRed:0.2 green:0.8 blue:0.4 alpha:0.9];
-            NSLog(@"[VCam] 视频加载完成，遮罩已生成");
+            VCamLog(@"视频已加载，虚拟相机开启");
         });
     });
 }
@@ -213,14 +311,20 @@ static VCamImagePickerControllerDelegate *g_pickerDelegate = nil;
 
 static void handleTapGesture(UITapGestureRecognizer *gesture) {
     UIViewController *topVC = findTopViewController();
-    if (!topVC) return;
-    g_overlayWindow.isShowingAlert = YES;
-    g_overlayWindow.windowLevel = UIWindowLevelAlert + 1;
+    if (!topVC) {
+        VCamLog(@"点按悬浮球：找不到 topViewController，忽略");
+        return;
+    }
+    VCamLog(@"点按悬浮球 topVC=%@ enabled=%d", NSStringFromClass([topVC class]), g_vcamEnabled);
 
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"VCam" message:g_vcamEnabled ? @"虚拟相机已启用" : @"虚拟相机已关闭" preferredStyle:UIAlertControllerStyleActionSheet];
 
     [alert addAction:[UIAlertAction actionWithTitle:@"选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        if (![UIImagePickerController isSourceTypeAvailable:UIImagePickerControllerSourceTypeSavedPhotosAlbum]) return;
+        if (![UIImagePickerController isSourceTypeAvailable:UIImagePickerControllerSourceTypeSavedPhotosAlbum]) {
+            VCamLog(@"相册不可用，无法选择视频");
+            return;
+        }
+        VCamLog(@"打开相册选视频");
         UIImagePickerController *picker = [[UIImagePickerController alloc] init];
         picker.sourceType = UIImagePickerControllerSourceTypeSavedPhotosAlbum;
         picker.mediaTypes = @[@"public.movie"];
@@ -233,18 +337,19 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
         if (g_floatButton) g_floatButton.backgroundColor = g_vcamEnabled ? [UIColor colorWithRed:0.2 green:0.8 blue:0.4 alpha:0.9] : [UIColor colorWithRed:0.4 green:0.4 blue:0.4 alpha:0.9];
         if (g_vcamEnabled) {
             [[MediaManager sharedManager] start];
-            if (g_selectedVideoUrl) createFullScreenMask(g_selectedVideoUrl);
+            if (g_selectedVideoUrl) {
+                createFullScreenMask(g_selectedVideoUrl);
+            } else {
+                VCamLog(@"已开启，但还没选过视频，遮罩不会出现");
+            }
         } else {
             [[MediaManager sharedManager] stop];
             destroyMask();
         }
-        NSLog(@"[VCam] 虚拟相机开关切换：%d", g_vcamEnabled);
+        VCamLog(@"虚拟相机开关切换：%d", g_vcamEnabled);
     }]];
 
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) {
-        g_overlayWindow.isShowingAlert = NO;
-        g_overlayWindow.windowLevel = UIWindowLevelStatusBar - 1;
-    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
 
     if (alert.popoverPresentationController) {
         alert.popoverPresentationController.sourceView = gesture.view;
@@ -261,6 +366,8 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
     if (!g_allVideoDelegates) g_allVideoDelegates = [NSMutableArray array];
     if (delegate && ![g_allVideoDelegates containsObject:delegate]) {
         [g_allVideoDelegates addObject:delegate];
+        VCamLog(@"捕获到 sampleBuffer delegate: %@ (共 %lu 个)",
+                NSStringFromClass([delegate class]), (unsigned long)g_allVideoDelegates.count);
     }
 }
 %end
@@ -268,6 +375,11 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
 %hook NSObject
 - (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection *)connection {
     if (g_vcamEnabled && [[MediaManager sharedManager] isRunning]) {
+        static BOOL loggedHit = NO;
+        if (!loggedHit) {
+            loggedHit = YES;
+            VCamLog(@"NSObject 层 hook 命中 output=%@", NSStringFromClass([output class]));
+        }
         CMSampleBufferRef fakeFrame = [[MediaManager sharedManager] nextVideoFrame];
         if (fakeFrame) {
             for (id del in g_allVideoDelegates) {
@@ -298,14 +410,25 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
         g_pickerDelegate = [[VCamImagePickerControllerDelegate alloc] init];
         g_allVideoDelegates = nil;
         g_selectedVideoUrl = nil;
-        destroyMask();
+
         NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
-        if (![bundleID isEqualToString:@"com.apple.springboard"]) {
+        BOOL isSpringBoard = [bundleID isEqualToString:@"com.apple.springboard"];
+
+        VCamLog(@"=== VCam 已加载 bundle=%@ pid=%d springboard=%d ===",
+                bundleID, [NSProcessInfo processInfo].processIdentifier, isSpringBoard);
+        VCamLog(@"日志路径=%@", g_logPath ?: @"(null)");
+
+        if (!isSpringBoard) {
             %init(VCamHooks);
+            VCamLog(@"VCamHooks 已初始化");
+        } else {
+            VCamLog(@"SpringBoard 内跳过 hooks 初始化");
         }
+
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             @autoreleasepool {
                 setupFloatButton();
+                VCamLog(@"悬浮球已创建");
             }
         });
     }
