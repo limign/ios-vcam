@@ -120,29 +120,35 @@ jobs:
         files: output/*.deb
         make_latest: true
 
-    # 失败时把编译日志推到一个固定分支 ci-log，本地 `git fetch origin ci-log` 就能读。
+    # 失败时把编译日志写成 Release 资产发布出去。
     # 原因：Actions 的日志要登录才能看，而开发机是 Windows / 没有 iOS SDK，
     # 唯一能编译的就是 CI —— 不这么做，每次失败都得人工去网页上把日志贴回来。
-    # 放在最后一步，任何一个环节失败都能捞到；只强推 ci-log 分支，不碰 main。
-    - name: Publish build log on failure
+    #
+    # 通道用 Release 资产（tag ci-log，匿名可读），和 deb 的发布是同一条路，已经验证可行；
+    # 试过 git push 到 ci-log 分支，那一步自己会失败，而且失败原因还看不到（鸡生蛋）。
+    # 放在最后一步，任何环节失败都能捞到；每次覆盖同一个 tag，不碰 main 也不影响 latest。
+    - name: Collect build log
       if: failure()
       run: |
-        git config user.name "ci"
-        git config user.email "ci@users.noreply.github.com"
-        (git fetch --depth=1 origin ci-log && git checkout -B ci-log FETCH_HEAD) || git checkout -B ci-log
         {
-          echo "# 构建失败日志 commit ${{ github.sha }}"
-          echo
-          echo '```'
+          printf '# 构建失败日志 commit %s\n\n```\n' "${{ github.sha }}"
           grep -v '^[[:space:]]*$' /tmp/vcam-build.log 2>/dev/null | tail -400
-          echo '```'
-          echo
-          echo '## packages/ 目录'
-          echo
-          echo '```'
+          printf '\n```\n\n## packages/ 目录\n\n```\n'
           ls -la packages/ 2>&1
-          echo '```'
+          printf '\n```\n'
         } > ci-fail.md
-        git add -f ci-fail.md
-        git commit --allow-empty -m "ci-fail ${{ github.sha }}"
-        git push -f origin ci-log
+        wc -l ci-fail.md
+
+    - name: Publish build log
+      if: failure()
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ci-log
+        name: CI failure log
+        prerelease: true
+        make_latest: false
+        body: |
+          构建失败时自动发布的编译日志（commit `${{ github.sha }}`）。
+          设备侧/本地直接下载查看：
+          `curl -L https://github.com/limign/ios-vcam/releases/download/ci-log/ci-fail.md`
+        files: ci-fail.md
