@@ -155,6 +155,7 @@ static BOOL g_vcamEnabled = NO;              // 本进程视角的开关，由�
 static VCamOverlayWindow *g_overlayWindow = nil;
 static UIButton *g_floatButton = nil;
 static AVPlayer *g_maskPlayer = nil;
+static AVPlayerLooper *g_looper = nil;       // 必须强引用，否则循环立刻失效
 static NSURL *g_selectedVideoUrl = nil;      // 本进程选中的视频（原始 URL，仅供本进程用）
 static NSString *g_playingPath = nil;        // 播放器当前加载的文件路径
 static NSString *s_sharedDir = nil;          // 本进程实测可写的共享目录（记忆化）
@@ -317,6 +318,7 @@ static void vcamTeardownPlayer(void) {
         [g_maskPlayer pause];
         g_maskPlayer = nil;
     }
+    g_looper = nil;
     g_playingPath = nil;
 }
 
@@ -324,27 +326,119 @@ static void vcamTeardownPlayer(void) {
 static void vcamStartPlayer(NSString *path) {
     vcamTeardownPlayer();
 
-    AVPlayerItem *item = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:path]];
-    g_maskPlayer = [AVPlayer playerWithPlayerItem:item];
-    g_maskPlayer.actionAtItemEnd = AVPlayerActionAtItemEndNone;
+    NSURL *url = [NSURL fileURLWithPath:path];
+    AVPlayerItem *template = [AVPlayerItem playerItemWithURL:url];
+
+    // 循环用 AVPlayerLooper（配 AVQueuePlayer）。之前是自己监听
+    // AVPlayerItemDidPlayToEndTimeNotification 再 seek 回零，实测播完就停 ——
+    // 那个通知依赖 item 真的走到结尾，且 seek 与 play 的时序容易丢，
+    // 交给系统这个专门做无缝循环的 API 更可靠。
+    AVQueuePlayer *queuePlayer = [AVQueuePlayer queuePlayerWithItems:@[template]];
+    queuePlayer.actionAtItemEnd = AVPlayerActionAtItemEndAdvance;
+    g_looper = [AVPlayerLooper playerLooperWithPlayer:queuePlayer templateItem:template];
+
+    g_maskPlayer = queuePlayer;
     g_playingPath = [path copy];
 
-    // 播完回到开头接着放，否则放到结尾就定格成一张静止画面
-    [[NSNotificationCenter defaultCenter]
-        addObserverForName:AVPlayerItemDidPlayToEndTimeNotification
-                    object:item
-                     queue:[NSOperationQueue mainQueue]
-                usingBlock:^(NSNotification *note) {
-        AVPlayer *p = g_maskPlayer;
-        if (p && p.currentItem == item) {
-            [p seekToTime:kCMTimeZero];
-            [p play];
-        }
-    }];
-
     [g_maskPlayer play];
-    VCamLog(@"开始播放 %@（本进程已登记预览层 %lu 个）",
+    VCamLog(@"开始播放（循环）%@（本进程已登记预览层 %lu 个）",
             path, (unsigned long)g_previewLayers.count);
+}
+
+#pragma mark 当前帧取样（拍照替换用）
+
+// 拍到的仍是真实画面：预览层覆盖只改了「显示」，采集数据没动。
+// 要改采集结果，只能在 App 取图时把它换掉 —— 见文件末尾 AVCapturePhoto 的 hook。
+static AVAssetImageGenerator *g_imageGen = nil;
+static NSString *g_imageGenPath = nil;
+static CVPixelBufferRef g_lastFakePixelBuffer = NULL;
+
+static AVAssetImageGenerator *vcamImageGenerator(void) {
+    if (g_playingPath.length == 0) return nil;
+    if (g_imageGen && [g_imageGenPath isEqualToString:g_playingPath]) return g_imageGen;
+
+    AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:g_playingPath]];
+    if (!asset) return nil;
+    g_imageGen = [AVAssetImageGenerator assetImageGeneratorWithAsset:asset];
+    g_imageGen.appliesPreferredTrackTransform = YES;
+    g_imageGen.requestedTimeToleranceBefore = kCMTimeZero;
+    g_imageGen.requestedTimeToleranceAfter = kCMTimeZero;
+    g_imageGenPath = [g_playingPath copy];
+    return g_imageGen;
+}
+
+// 取播放头当前位置的那一帧。+1 的 CGImage，调用方负责 CGImageRelease；失败返回 NULL
+static CGImageRef vcamCopyCurrentFrameImage(void) {
+    AVAssetImageGenerator *gen = vcamImageGenerator();
+    if (!gen) return NULL;
+
+    CMTime t = g_maskPlayer ? g_maskPlayer.currentTime : kCMTimeZero;
+    CGImageRef img = [gen copyCGImageAtTime:t actualTime:NULL error:NULL];
+    // 播放头正好卡在结尾时会取不到，退回第一帧，总比让 App 拿到真图好
+    if (!img) img = [gen copyCGImageAtTime:kCMTimeZero actualTime:NULL error:NULL];
+    return img;
+}
+
+static NSData *vcamFakePhotoData(void) {
+    if (!g_vcamEnabled || !g_maskPlayer || g_playingPath.length == 0) return nil;
+
+    CGImageRef img = vcamCopyCurrentFrameImage();
+    if (!img) {
+        VCamLog(@"拍照替换：取当前帧失败，回退真实画面");
+        return nil;
+    }
+
+    UIImage *ui = [UIImage imageWithCGImage:img];
+    CGImageRelease(img);
+    NSData *jpeg = [ui jpegDataWithCompressionQuality:0.92];
+    if (jpeg) {
+        static BOOL logged = NO;
+        if (!logged) {
+            logged = YES;
+            VCamLog(@"拍照替换生效：已返回假 JPEG %lu 字节", (unsigned long)jpeg.length);
+        }
+    }
+    return jpeg;
+}
+
+static CVPixelBufferRef vcamFakePixelBuffer(void) {
+    if (!g_vcamEnabled || !g_maskPlayer || g_playingPath.length == 0) return NULL;
+
+    CGImageRef img = vcamCopyCurrentFrameImage();
+    if (!img) return NULL;
+
+    size_t w = CGImageGetWidth(img);
+    size_t h = CGImageGetHeight(img);
+    NSDictionary *attrs = @{
+        (id)kCVPixelBufferCGImageCompatibilityKey: @YES,
+        (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
+    };
+    CVPixelBufferRef pb = NULL;
+    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA,
+                            (__bridge CFDictionaryRef)attrs, &pb) != kCVReturnSuccess || !pb) {
+        CGImageRelease(img);
+        return NULL;
+    }
+
+    CVPixelBufferLockBaseAddress(pb, 0);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(CVPixelBufferGetBaseAddress(pb), w, h, 8,
+                                             CVPixelBufferGetBytesPerRow(pb), cs,
+                                             kCGImageAlphaPremultipliedFirst |
+                                             kCGBitmapByteOrder32Little);
+    if (ctx) {
+        CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), img);
+        CGContextRelease(ctx);
+    }
+    CGColorSpaceRelease(cs);
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+    CGImageRelease(img);
+
+    // -pixelBuffer 这个方法名不表示调用方持有返回值，所以由我们保住这块 buffer，
+    // 换新的时再释放旧的，避免每次拍照都漏一块。
+    if (g_lastFakePixelBuffer) CVPixelBufferRelease(g_lastFakePixelBuffer);
+    g_lastFakePixelBuffer = pb;
+    return g_lastFakePixelBuffer;
 }
 
 // 主线程。读共享状态 → 对齐播放器 → 让每个预览层同步覆盖层。
@@ -615,6 +709,27 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
 
 %hook AVCapturePhotoOutput
 - (void)capturePhotoWithSettings:(AVCapturePhotoSettings *)settings delegate:(id<AVCapturePhotoCaptureDelegate>)delegate { %orig; }
+%end
+
+// 拍照替换。AVCapturePhoto 几乎无法自行构造，只能改它的取值方法，
+// 让 App 从它身上取到的图变成我们生成的。取不到假图时一律回退 %orig，
+// 绝不能让拍照这个基础功能因为插件而失效。
+%hook AVCapturePhoto
+- (NSData *)fileDataRepresentation {
+    NSData *fake = vcamFakePhotoData();
+    if (fake) return fake;
+    return %orig;
+}
+- (NSData *)fileDataRepresentationWithCustomizer:(id<AVCapturePhotoFileDataRepresentationCustomizer>)customizer {
+    NSData *fake = vcamFakePhotoData();
+    if (fake) return fake;
+    return %orig;
+}
+- (CVPixelBufferRef)pixelBuffer {
+    CVPixelBufferRef fake = vcamFakePixelBuffer();
+    if (fake) return fake;
+    return %orig;
+}
 %end
 
 // 相机预览层：系统相机、微信视频通话等一切「把摄像头画面显示出来」的地方都经过它。
