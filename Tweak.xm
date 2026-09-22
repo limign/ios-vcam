@@ -458,7 +458,7 @@ static void vcamStartPlayer(NSString *path) {
     // 自己往队列里插副本（文档原话是它不会参与实际播放）。上一版把 templateItem
     // 塞进 queuePlayerWithItems: 一起交出去，结果队列里那个只当模板的 item 反而
     // 排在前面，画面就定在第一帧不动 —— 所以这里改成空队列。
-    AVQueuePlayer *queuePlayer = [AVQueuePlayer queuePlayer];
+    AVQueuePlayer *queuePlayer = [[AVQueuePlayer alloc] init];
     queuePlayer.actionAtItemEnd = AVPlayerActionAtItemEndAdvance;
     g_looper = [AVPlayerLooper playerLooperWithPlayer:queuePlayer templateItem:templateItem];
 
