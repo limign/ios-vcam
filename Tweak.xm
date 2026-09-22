@@ -152,28 +152,6 @@ static void vcamStartOverlay(NSURL *videoUrl);
 static void vcamStopOverlay(void);
 static void vcamSyncPreviewOverlay(AVCaptureVideoPreviewLayer *layer);
 
-#pragma mark 兼容iOS13+ 获取前台活跃窗口（废弃keyWindow替代方案）
-static UIWindow *getActiveKeyWindow(void) {
-    UIWindow *targetWin = nil;
-    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        // connectedScenes 里不保证都是 UIWindowScene，而 -windows 只存在于 UIWindowScene。
-        // 直接对普通 UIScene 取 .windows 会是「向 UIResponder 发未实现消息」→ 未捕获异常 → SIGABRT。
-        // 崩溃日志正是这个形状：手势回调 → VCam.dylib → 消息转发 → doesNotRecognizeSelector。
-        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-        if (scene.activationState == UISceneActivationStateForegroundActive) {
-            UIWindowScene *winScene = (UIWindowScene *)scene;
-            for (UIWindow *win in winScene.windows) {
-                if (win.isKeyWindow && win.isHidden == NO) {
-                    targetWin = win;
-                    break;
-                }
-            }
-            if (targetWin) break;
-        }
-    }
-    return targetWin;
-}
-
 #pragma mark 预览层覆盖
 // 正在同步的标记：addSublayer / 改 frame 都会让父层重新 layout，
 // 进而再次回调 layoutSublayers，没有这个闩就会递归。
@@ -337,7 +315,10 @@ static void handlePanGesture(UIPanGestureRecognizer *gesture) {
 static UIViewController *findTopViewController(void) {
     UIViewController *topVC = nil;
     for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        // 同 getActiveKeyWindow：非 UIWindowScene 不能取 .windows
+        // connectedScenes 里不保证都是 UIWindowScene，而 -windows 只存在于 UIWindowScene。
+        // 对普通 UIScene 取 .windows 是「向 UIResponder 发未实现消息」→ 未捕获异常 → SIGABRT。
+        // 设备崩溃日志正是这个形状：_UIGestureRecognizerSendTargetActions → VCam.dylib
+        // → 消息转发 → -[UIResponder doesNotRecognizeSelector:] → abort。
         if (![scene isKindOfClass:[UIWindowScene class]]) continue;
         if (scene.activationState != UISceneActivationStateForegroundActive) continue;
         for (UIWindow *w in ((UIWindowScene *)scene).windows) {
