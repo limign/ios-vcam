@@ -130,13 +130,35 @@ static void VCamLog(NSString *format, ...) {
 @implementation VCamFloatButton
 @end
 
+#pragma mark 跨进程共享状态
+// 相机 / 微信 / 相册选择器各自是独立进程，开关和视频原本只存在进程内的 static 里。
+// 实测失败案例：在 A 应用里开启并选好视频，再打开系统相机 —— 相机进程的
+// g_vcamEnabled 是 NO，它根本不知道别的进程开过，于是预览原样不动。
+// 所以开关和视频必须落到一个各进程都够得着的共享位置。
+//
+// 候选目录按优先级排列，运行时用探针文件实测哪个真能写（各 App 沙盒放开程度不同）：
+//   /var/tmp/VCam                权限 1777，实测相机进程就写在这里，最可靠
+//   /var/jb/var/mobile/Library    roothide 的共享库目录
+//   /var/mobile/Library          越狱传统共享位置
+// 视频文件也必须复制过来：相册给的原始 URL 指向选择器自己的容器，别的进程读不到。
+static NSArray *vcamSharedCandidates(void) {
+    return @[
+        @"/var/tmp/VCam",
+        @"/var/jb/var/mobile/Library/VCam",
+        @"/var/mobile/Library/VCam",
+    ];
+}
+
 #pragma mark 全局变量
 static NSMutableArray* g_allVideoDelegates = nil;
-static BOOL g_vcamEnabled = NO;
+static BOOL g_vcamEnabled = NO;              // 本进程视角的开关，由共享状态驱动
 static VCamOverlayWindow *g_overlayWindow = nil;
 static UIButton *g_floatButton = nil;
 static AVPlayer *g_maskPlayer = nil;
-static NSURL *g_selectedVideoUrl = nil;
+static NSURL *g_selectedVideoUrl = nil;      // 本进程选中的视频（原始 URL，仅供本进程用）
+static NSString *g_playingPath = nil;        // 播放器当前加载的文件路径
+static NSString *s_sharedDir = nil;          // 本进程实测可写的共享目录（记忆化）
+static BOOL s_sharedDirProbed = NO;
 
 // 相机预览层注册表。遮罩不再盖整屏，而是贴到每个 AVCaptureVideoPreviewLayer 上：
 // 整屏遮罩有两个致命问题 —— 1) 猜不准该盖哪个 window（预览常在别的 window 上，
@@ -148,9 +170,10 @@ static NSMapTable *g_previewOverlays = nil;   // weak key: 预览层 -> strong v
 static void setupFloatButton(void);
 static void handlePanGesture(UIPanGestureRecognizer *gesture);
 static void handleTapGesture(UITapGestureRecognizer *gesture);
-static void vcamStartOverlay(NSURL *videoUrl);
-static void vcamStopOverlay(void);
 static void vcamSyncPreviewOverlay(AVCaptureVideoPreviewLayer *layer);
+static void vcamApplySharedState(void);
+static void vcamWriteSharedState(BOOL enabled, NSString *videoPath);
+static BOOL vcamReadSharedState(BOOL *enabled, NSString **path);
 
 #pragma mark 预览层覆盖
 // 正在同步的标记：addSublayer / 改 frame 都会让父层重新 layout，
@@ -197,65 +220,175 @@ static void vcamSyncPreviewOverlay(AVCaptureVideoPreviewLayer *layer) {
     s_syncingPreview = NO;
 }
 
+#pragma mark 共享状态读写
+
+// 本进程实测可写的共享目录。forWrite=NO 时反过来找「已经存在状态文件」的那个（用于读）
+static NSString *vcamSharedDir(BOOL forWrite) {
+    if (forWrite && s_sharedDirProbed) return s_sharedDir;
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *c in vcamSharedCandidates()) {
+        [fm createDirectoryAtPath:c withIntermediateDirectories:YES attributes:nil error:NULL];
+        // 目录得让别的进程也能进能读，否则状态写进去别人也取不到
+        [fm setAttributes:@{NSFilePosixPermissions: @0777} ofItemAtPath:c error:NULL];
+
+        if (!forWrite) {
+            if ([fm fileExistsAtPath:[c stringByAppendingPathComponent:@"state.plist"]]) return c;
+            continue;
+        }
+        // 建得出来不代表写得进去（沙盒按路径拦），必须真写探针文件
+        NSString *probe = [c stringByAppendingPathComponent:@".probe"];
+        if ([@"ok" writeToFile:probe atomically:YES encoding:NSUTF8StringEncoding error:NULL]) {
+            [fm removeItemAtPath:probe error:NULL];
+            s_sharedDirProbed = YES;
+            s_sharedDir = c;
+            VCamLog(@"共享目录选定：%@", c);
+            return c;
+        }
+    }
+
+    if (forWrite) {
+        s_sharedDirProbed = YES;
+        s_sharedDir = nil;
+        VCamLog(@"没有可写的共享目录，开关只在本进程生效");
+    }
+    return nil;
+}
+
+// 读缓存。放在文件作用域是为了让写入方能主动失效它（见下）
+static NSTimeInterval s_stateReadAt = 0;
+static BOOL s_stateEnabled = NO;
+static NSString *s_statePath = nil;
+
+// 写完共享状态必须调这个：否则紧接着的读取会命中 0.5s 节流窗口里的旧值，
+// 表现就是「刚点开启，本进程却没反应」，要等下一次同步才补上。
+static void vcamInvalidateSharedStateCache(void) {
+    s_stateReadAt = 0;
+}
+
+// 读共享状态。layoutSublayers 触发很频繁，节流 0.5s，免得每次布局都去碰文件
+static BOOL vcamReadSharedState(BOOL *enabled, NSString **path) {
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (now - s_stateReadAt > 0.5) {
+        s_stateReadAt = now;
+        s_stateEnabled = NO;
+        s_statePath = nil;
+        for (NSString *c in vcamSharedCandidates()) {
+            NSDictionary *st = [NSDictionary dictionaryWithContentsOfFile:
+                                [c stringByAppendingPathComponent:@"state.plist"]];
+            if (![st isKindOfClass:[NSDictionary class]]) continue;
+            s_stateEnabled = [st[@"enabled"] boolValue];
+            id p = st[@"videoPath"];
+            if ([p isKindOfClass:[NSString class]]) s_statePath = [p copy];
+            break;
+        }
+    }
+
+    if (enabled) *enabled = s_stateEnabled;
+    if (path) *path = s_statePath;
+    return s_stateEnabled;
+}
+
+static void vcamWriteSharedState(BOOL enabled, NSString *videoPath) {
+    NSString *dir = vcamSharedDir(YES);
+    if (!dir) {
+        VCamLog(@"无可写共享目录，开关仅本进程有效");
+        return;
+    }
+
+    NSMutableDictionary *st = [NSMutableDictionary dictionary];
+    st[@"enabled"] = @(enabled);
+    if (videoPath) st[@"videoPath"] = videoPath;
+
+    NSString *sp = [dir stringByAppendingPathComponent:@"state.plist"];
+    BOOL ok = [st writeToFile:sp atomically:YES];
+    // 别的进程要读得到，显式放宽读权限
+    [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0644}
+                                     ofItemAtPath:sp error:NULL];
+    vcamInvalidateSharedStateCache();
+    VCamLog(@"共享状态写入 enabled=%d path=%@ -> %@ ok=%d", enabled, videoPath, sp, ok);
+}
+
+#pragma mark 播放器与覆盖层
+
 // 主线程
-static void vcamAttachToAllPreviewLayers(void) {
+static void vcamTeardownPlayer(void) {
+    if (g_maskPlayer) {
+        [g_maskPlayer pause];
+        g_maskPlayer = nil;
+    }
+    g_playingPath = nil;
+}
+
+// 主线程
+static void vcamStartPlayer(NSString *path) {
+    vcamTeardownPlayer();
+
+    AVPlayerItem *item = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:path]];
+    g_maskPlayer = [AVPlayer playerWithPlayerItem:item];
+    g_maskPlayer.actionAtItemEnd = AVPlayerActionAtItemEndNone;
+    g_playingPath = [path copy];
+
+    // 播完回到开头接着放，否则放到结尾就定格成一张静止画面
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:AVPlayerItemDidPlayToEndTimeNotification
+                    object:item
+                     queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification *note) {
+        AVPlayer *p = g_maskPlayer;
+        if (p && p.currentItem == item) {
+            [p seekToTime:kCMTimeZero];
+            [p play];
+        }
+    }];
+
+    [g_maskPlayer play];
+    VCamLog(@"开始播放 %@（本进程已登记预览层 %lu 个）",
+            path, (unsigned long)g_previewLayers.count);
+}
+
+// 主线程。读共享状态 → 对齐播放器 → 让每个预览层同步覆盖层。
+// 这是唯一的状态入口：setSession / layoutSublayers / 回到前台 / 点按开关都汇到这里。
+static BOOL s_applyingSharedState = NO;
+
+static void vcamApplySharedState(void) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ vcamApplySharedState(); });
+        return;
+    }
+    // 内部会 addSublayer，可能反过来触发 layoutSublayers 再回到这里；
+    // 本函数全程在主线程，一个简单的闩就够，且外层那次调用已经把事情做完了。
+    if (s_applyingSharedState) return;
+    s_applyingSharedState = YES;
+
+    BOOL enabled = NO;
+    NSString *path = nil;
+    vcamReadSharedState(&enabled, &path);
+
+    BOOL wantPlay = enabled && path.length > 0 &&
+                    [[NSFileManager defaultManager] fileExistsAtPath:path];
+
+    if (wantPlay) {
+        if (!g_maskPlayer || ![path isEqualToString:g_playingPath]) {
+            vcamStartPlayer(path);
+        }
+    } else if (g_maskPlayer) {
+        VCamLog(@"共享状态为关闭或视频读不到，停止播放");
+        vcamTeardownPlayer();
+    }
+
+    g_vcamEnabled = (g_maskPlayer != nil);
+    if (g_floatButton) {
+        g_floatButton.backgroundColor = g_vcamEnabled
+            ? [UIColor colorWithRed:0.2 green:0.8 blue:0.4 alpha:0.9]
+            : [UIColor colorWithRed:0.4 green:0.4 blue:0.4 alpha:0.9];
+    }
+
     for (AVCaptureVideoPreviewLayer *l in g_previewLayers.allObjects) {
         vcamSyncPreviewOverlay(l);
     }
-}
 
-// 主线程。先在数组里收好键再改表，避免边遍历边删
-static void vcamDetachAllOverlays(void) {
-    NSArray *layers = g_previewOverlays.keyEnumerator.allObjects;
-    for (AVCaptureVideoPreviewLayer *l in layers) {
-        [[g_previewOverlays objectForKey:l] removeFromSuperlayer];
-        [g_previewOverlays removeObjectForKey:l];
-    }
-    if (layers.count) VCamLog(@"已移除 %lu 个预览层覆盖", (unsigned long)layers.count);
-}
-
-static void vcamStartOverlay(NSURL *videoUrl) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        vcamDetachAllOverlays();
-        if (g_maskPlayer) {
-            [g_maskPlayer pause];
-            g_maskPlayer = nil;
-        }
-
-        AVPlayerItem *item = [AVPlayerItem playerItemWithURL:videoUrl];
-        g_maskPlayer = [AVPlayer playerWithPlayerItem:item];
-        g_maskPlayer.actionAtItemEnd = AVPlayerActionAtItemEndNone;
-
-        // 播完回到开头接着放，否则视频放到结尾就定格成一张静止画面
-        [[NSNotificationCenter defaultCenter]
-            addObserverForName:AVPlayerItemDidPlayToEndTimeNotification
-                        object:item
-                         queue:[NSOperationQueue mainQueue]
-                    usingBlock:^(NSNotification *note) {
-            AVPlayer *p = g_maskPlayer;
-            if (p && p.currentItem == item) {
-                [p seekToTime:kCMTimeZero];
-                [p play];
-            }
-        }];
-
-        [g_maskPlayer play];
-        vcamAttachToAllPreviewLayers();
-        VCamLog(@"视频已开播：已登记预览层 %lu 个，已挂覆盖 %lu 个",
-                (unsigned long)g_previewLayers.count,
-                (unsigned long)g_previewOverlays.count);
-    });
-}
-
-static void vcamStopOverlay(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        vcamDetachAllOverlays();
-        if (g_maskPlayer) {
-            [g_maskPlayer pause];
-            g_maskPlayer = nil;
-        }
-        VCamLog(@"虚拟相机已停止，覆盖层已清理");
-    });
+    s_applyingSharedState = NO;
 }
 
 static void setupFloatButton() {
@@ -348,13 +481,32 @@ static UIViewController *findTopViewController(void) {
     }
     VCamLog(@"已选中视频 url=%@", srcUrl.path);
     g_selectedVideoUrl = srcUrl;
+
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
         [[MediaManager sharedManager] loadMediaFromURL:srcUrl];
+
+        // 相册给的这个 URL 指向选择器自己的容器，别的进程没有读权限。
+        // 必须复制一份到共享目录，否则「在这个应用里选完、打开相机」相机读不到文件。
+        NSString *sharedVideo = nil;
+        NSString *sharedDir = vcamSharedDir(YES);
+        if (sharedDir) {
+            NSFileManager *fm = [NSFileManager defaultManager];
+            NSString *dst = [sharedDir stringByAppendingPathComponent:@"media.mov"];
+            [fm removeItemAtPath:dst error:NULL];
+            NSError *err = nil;
+            if ([fm copyItemAtPath:srcUrl.path toPath:dst error:&err]) {
+                [fm setAttributes:@{NSFilePosixPermissions: @0644} ofItemAtPath:dst error:NULL];
+                sharedVideo = dst;
+                VCamLog(@"视频已复制到共享位置 %@", dst);
+            } else {
+                VCamLog(@"复制视频到共享位置失败：%@", err.localizedDescription);
+            }
+        }
+
         dispatch_async(dispatch_get_main_queue(), ^{
-            g_vcamEnabled = YES;
             [[MediaManager sharedManager] start];
-            vcamStartOverlay(srcUrl);
-            if (g_floatButton) g_floatButton.backgroundColor = [UIColor colorWithRed:0.2 green:0.8 blue:0.4 alpha:0.9];
+            vcamWriteSharedState(YES, sharedVideo ?: srcUrl.path);
+            vcamApplySharedState();
             VCamLog(@"视频已加载，虚拟相机开启");
         });
     });
@@ -389,20 +541,26 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
     }]];
 
     [alert addAction:[UIAlertAction actionWithTitle:g_vcamEnabled ? @"关闭虚拟相机" : @"开启虚拟相机" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        g_vcamEnabled = !g_vcamEnabled;
-        if (g_floatButton) g_floatButton.backgroundColor = g_vcamEnabled ? [UIColor colorWithRed:0.2 green:0.8 blue:0.4 alpha:0.9] : [UIColor colorWithRed:0.4 green:0.4 blue:0.4 alpha:0.9];
-        if (g_vcamEnabled) {
+        BOOL target = !g_vcamEnabled;
+
+        if (target) {
             [[MediaManager sharedManager] start];
-            if (g_selectedVideoUrl) {
-                vcamStartOverlay(g_selectedVideoUrl);
-            } else {
-                VCamLog(@"已开启，但还没选过视频，预览不会被替换");
+            // 本进程没选过视频时，沿用共享状态里已有的那个 —— 开关和视频是两个独立的共享字段，
+            // 不能因为这次没重新选片就把之前选好的视频丢掉。
+            NSString *existing = nil;
+            vcamReadSharedState(NULL, &existing);
+            NSString *videoPath = g_selectedVideoUrl.path ?: existing;
+            vcamWriteSharedState(YES, videoPath);
+            if (!videoPath) {
+                VCamLog(@"已开启，但哪儿都还没有选中的视频，预览不会被替换");
             }
         } else {
             [[MediaManager sharedManager] stop];
-            vcamStopOverlay();
+            vcamWriteSharedState(NO, nil);
         }
-        VCamLog(@"虚拟相机开关切换：%d", g_vcamEnabled);
+
+        vcamApplySharedState();
+        VCamLog(@"虚拟相机开关切换：%d", target);
     }]];
 
     [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
@@ -466,13 +624,20 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
     %orig;
     if (!g_previewLayers) g_previewLayers = [NSHashTable weakObjectsHashTable];
     [g_previewLayers addObject:self];
-    VCamLog(@"登记相机预览层 %p session=%p", self, session);
-    vcamSyncPreviewOverlay(self);
+
+    BOOL sharedOn = NO;
+    NSString *sharedPath = nil;
+    vcamReadSharedState(&sharedOn, &sharedPath);
+    VCamLog(@"登记相机预览层 %p session=%p 共享开关=%d 共享视频=%@",
+            self, session, sharedOn, sharedPath);
+
+    // 这一步很关键：相机进程在这里才第一次知道「别的进程已经把虚拟相机打开了」
+    vcamApplySharedState();
 }
 - (void)layoutSublayers {
     %orig;
-    // 旋转 / 改变尺寸 / 切前后摄都会触发，用来把覆盖层几何同步过去
-    vcamSyncPreviewOverlay(self);
+    // 旋转 / 改尺寸 / 切前后摄会触发；同时也是回到前台后补同步的机会
+    vcamApplySharedState();
 }
 %end
 %end
@@ -500,6 +665,16 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
         } else {
             VCamLog(@"SpringBoard 内跳过 hooks 初始化");
         }
+
+        // 在别的应用里开了开关再切回来时，预览层不会重新 setSession，
+        // layoutSublayers 也不一定触发，靠回到前台这一下补同步。
+        [[NSNotificationCenter defaultCenter]
+            addObserverForName:UIApplicationDidBecomeActiveNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) {
+            vcamApplySharedState();
+        }];
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             @autoreleasepool {
