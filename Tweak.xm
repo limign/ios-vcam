@@ -13,9 +13,15 @@ static void VCamLogInit(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         NSFileManager *fm = [NSFileManager defaultManager];
-        // 优先共享目录；沙盒里不可写时退回本 App 容器 tmp（必然可写，但仅本进程可见）
+        // 顺序说明：/var/jb/... 是越狱原生位置（最干净，但 roothide 沙盒里多数 App 写不进去）；
+        // /var/tmp/VCam 是共享目录 —— 这条是补上的关键一条：相机 App 原来两个候选位置全被拒
+        // （系统 App 没有可写的容器 tmp），于是相机进程一条日志都没留下。而虚拟相机真正要动
+        // 的采集/写入/元数据全发生在相机进程里 —— 没有相机侧的日志就只能靠猜，
+        // 已经猜错过三次了。共享目录里的 state.plist 本来就是相机那边写成功的，说明它写得进去。
+        // 最后仍然退回本进程容器 tmp（必然可写，但只有本进程看得见）。
         NSArray<NSString *> *candidates = @[
             @"/var/jb/var/mobile/Library/VCam",
+            @"/var/tmp/VCam",
             [NSTemporaryDirectory() stringByAppendingPathComponent:@"VCam"],
         ];
         NSString *dir = nil;
@@ -92,6 +98,10 @@ static void VCamLog(NSString *format, ...) {
 
 // 定义在后面，但采集注入那一段要用它 —— 少了这行声明就是隐式声明，-Werror 直接卡构建
 static void VCamLogOnce(NSString *tag, NSString *msg);
+
+// 同理。它的定义在"采集拓扑诊断"那一段（要看 vcamLogThrottle 等），
+// 但播放器那一段要用它按 KVC 取结构体属性。C++ 里没有隐式函数声明，缺了这行直接卡构建。
+static id vcamValueIfResponds(id obj, SEL sel);
 
 #pragma mark 悬浮穿透窗口 前置定义解决类型未识别报错
 @interface VCamOverlayWindow : UIWindow
@@ -266,33 +276,48 @@ static BOOL vcamHookImplementation(id obj, SEL sel, IMP hook) {
     return vcamHookClass(object_getClass(obj), sel, hook);
 }
 
-// 把录下来的文件换成我们的视频。重复调用无害（目标已存在就先删再拷），
-// 失败只记日志不抛，绝不能影响录像本身。
+// 把录下来的文件换成我们的视频。重复调用无害，失败只记日志不抛，绝不能影响录像本身。
+//
+// 顺序上有个坑：原来是"先把原文件删了，再拷我们的"。拷贝只要失败（源读不到、目录一时
+// 不可用、空间不足），用户刚录的那段就**彻底没了**，而且连替代品也没有。改成先拷到
+// 同目录的临时文件（同卷改名是原子操作）、拷成功才顶掉原文件 —— 拷贝失败时原文件原封不动。
 static void vcamReplaceRecordedFile(NSURL *url) {
     if (!g_vcamEnabled || g_playingPath.length == 0 || url.path.length == 0) return;
+    if ([g_playingPath isEqualToString:url.path]) return;      // 源和目标同一个就别折腾
 
     NSError *err = nil;
     NSFileManager *fm = [NSFileManager defaultManager];
-    if ([fm fileExistsAtPath:url.path]) {
-        [fm removeItemAtPath:url.path error:NULL];
+    NSString *tmp = [url.path stringByAppendingString:@".vcam.tmp"];
+    [fm removeItemAtPath:tmp error:NULL];
+
+    if (![fm copyItemAtPath:g_playingPath toPath:tmp error:&err]) {
+        VCamLog(@"录像替换失败（原文件保持不动）：%@", err.localizedDescription);
+        return;
     }
-    if ([fm copyItemAtPath:g_playingPath toPath:url.path error:&err]) {
+    [fm removeItemAtPath:url.path error:NULL];
+    if ([fm moveItemAtPath:tmp toPath:url.path error:&err]) {
         VCamLog(@"录像替换生效：%@ <- %@", url.path, g_playingPath);
     } else {
-        VCamLog(@"录像替换失败：%@", err.localizedDescription);
+        // 同目录改名几乎不会失败；真失败了也别留垃圾，把临时文件挪回原位当替代品
+        VCamLog(@"录像替换收尾失败：%@", err.localizedDescription);
+        [fm moveItemAtPath:tmp toPath:url.path error:NULL];
     }
 }
 
-// 代理的 didFinishRecording 回调 —— 此时文件已定型，是替换的安全时机
+// 代理的 didFinishRecording 回调 —— 此时文件已定型，是替换的安全时机。
+// 第三个参数名是复数 fromConnections:，类型是 NSArray（是**组**连接，不是单个连接）——
+// 别跟 AVCaptureVideoDataOutput 那条单数的 fromConnection: 混了，上一版就是写成单数，
+// class_getInstanceMethod 找不到方法返回 nil，于是"没实现 didFinishRecording，跳过 hook"，
+// 这条替换路径静默地一次都没装上。
 static void vcamDidFinishRecording(id self, SEL _cmd, AVCaptureFileOutput *output,
-                                   NSURL *outputFileURL, AVCaptureConnection *connection,
+                                   NSURL *outputFileURL, NSArray *connections,
                                    NSError *error) {
     vcamReplaceRecordedFile(outputFileURL);
 
     IMP orig = vcamLookupOrig(self, _cmd);
     if (orig) {
-        ((void (*)(id, SEL, AVCaptureFileOutput *, NSURL *, AVCaptureConnection *, NSError *))orig)(
-            self, _cmd, output, outputFileURL, connection, error);
+        ((void (*)(id, SEL, AVCaptureFileOutput *, NSURL *, NSArray *, NSError *))orig)(
+            self, _cmd, output, outputFileURL, connections, error);
     }
 }
 
@@ -300,7 +325,7 @@ static void vcamDidFinishRecording(id self, SEL _cmd, AVCaptureFileOutput *outpu
 static void vcamInstallRecordHook(id delegate) {
     if (!delegate) return;
     Class cls = object_getClass(delegate);
-    SEL sel = @selector(captureOutput:didFinishRecordingToOutputFileAtURL:fromConnection:error:);
+    SEL sel = @selector(captureOutput:didFinishRecordingToOutputFileAtURL:fromConnections:error:);
     if (!class_getInstanceMethod(cls, sel)) {
         VCamLog(@"录像代理 %@ 没实现 didFinishRecording，跳过 hook", NSStringFromClass(cls));
         return;
@@ -344,8 +369,11 @@ static void vcamSyncPreviewOverlay(AVCaptureVideoPreviewLayer *layer) {
         overlay.frame = layer.bounds;
         [layer addSublayer:overlay];
         [g_previewOverlays setObject:overlay forKey:layer];
-        VCamLog(@"已挂上预览层覆盖 layer=%p bounds=%@", layer,
-                NSStringFromCGRect(layer.bounds));
+        // 记上播放器的当前状态：切换模式（拍照<->录像）后如果这里是新建的覆盖，
+        // 日志里就能看出"覆盖在、但播放器已经停了"还是"覆盖压根没建出来"
+        VCamLog(@"已挂上预览层覆盖 layer=%p bounds=%@ 播放器=%p rate=%.1f",
+                layer, NSStringFromCGRect(layer.bounds), g_maskPlayer,
+                g_maskPlayer ? g_maskPlayer.rate : 0.0f);
     } else if (!CGRectEqualToRect(overlay.frame, layer.bounds)) {
         // 旋转 / 切前后摄 / 进画中画都会改预览层几何
         overlay.frame = layer.bounds;
@@ -463,9 +491,24 @@ static NSLock *vcamFrameCacheLock(void) {
     return lock;
 }
 
+// 卡死看门狗与回零状态。它们都是"同一时刻只有一个播放器"的前提下才成立的单例状态，
+// 换播放器/拆播放器时必须一起复位（见 vcamTeardownPlayer）。
+static NSTimer *g_watchdog = nil;             // 0.5s 一跳，独立于播放时钟
+static BOOL s_rewinding = NO;                 // 回零途中：挡住第二次 seek
+static CFAbsoluteTime s_rewindStart = 0;      // 回零起点，用来兜底"seek 回调没回来"
+static CFAbsoluteTime s_lastKick = 0;         // 上次补 play 的时间，限流用
+static int s_kicks = 0;                       // 补 play 次数，日志按它决定记不记
+
 // 主线程
 static void vcamTeardownPlayer(void) {
     g_playGen++;      // 作废还在后台拷副本的那一次
+    if (g_watchdog) {
+        [g_watchdog invalidate];
+        g_watchdog = nil;
+    }
+    s_rewinding = NO;
+    s_rewindStart = 0;
+    s_lastKick = 0;
     if (g_maskPlayer) {
         // 顺序要紧：观察者的 block 持有播放器，不先摘掉就放不掉
         if (g_timeObserver) {
@@ -498,17 +541,142 @@ static void vcamTeardownPlayer(void) {
 // 回零重播。放在"还差一点点到结尾"时触发，而不是等 didPlayToEnd 通知：
 // 通知依赖 item 真的走到结尾才发，而且此时播放器已经停了，重新 play 的时序容易丢
 // （上一版就是这么变成"播完就停"的）。定时观察者只要在播就会一直回调，更早也更稳。
+//
+// 两处是针对用户报的"动态但经常卡住"改的：
+//   1) 零容差的 seek 是"精确到帧"，要从前面一个关键帧重新解，慢到肉眼可见。而观察者
+//      每 0.25s 就回调一次，每次看位置还在结尾就再排一次 seek —— 几次精确 seek 叠在
+//      一起，画面就一直定在最后一帧，看着就是卡住。现在给 1/15 秒容差（落到就近关键帧，
+//      快得多），并且同一时刻只允许一次 seek 在飞。
+//   2) 加一把看门狗（下面 vcamPlayerWatchdog），兜住"播放器被暂停且自己不会醒"的情况。
 static void vcamRewindAndPlay(AVPlayer *p) {
-    if (!p || p != g_maskPlayer) return;
+    if (!p || p != g_maskPlayer || s_rewinding) return;
+    s_rewinding = YES;
+    s_rewindStart = CFAbsoluteTimeGetCurrent();
+    CMTime tol = CMTimeMake(1, 15);
     [p seekToTime:kCMTimeZero
-        toleranceBefore:kCMTimeZero
-         toleranceAfter:kCMTimeZero
+        toleranceBefore:tol
+         toleranceAfter:tol
       completionHandler:^(BOOL finished) {
-        if (finished && p == g_maskPlayer) [p play];
+        // 回调的线程不保证，动播放器一律回主线程
+        dispatch_async(dispatch_get_main_queue(), ^{
+            s_rewinding = NO;
+            s_lastKick = CFAbsoluteTimeGetCurrent();   // 刚回零，别马上又补 play
+            if (finished && p == g_maskPlayer) [p play];
+        });
+    }];
+}
+
+// 看门狗：每 0.5s 跳一次，判断"该播但没在播"。
+//
+// 为什么不能只靠时间观察者（addPeriodicTimeObserverForInterval:）：它只在播放真的推进
+// 时周期性回调，播放器一停就只剩最后一次回调 —— 正好是它停住的那一刻，之后再也不跳，
+// 于是"卡住"这件事没人发现。所以用一个跟播放时钟无关的 NSTimer。
+//
+// 已知的、也是用户看到的"录像模式下画面静止"最可能的原因：资源里有音轨时，
+// AVPlayer 会去用 AVAudioSession，而相机一进录像模式就把会话切成 PlayAndRecord，
+// 播放器于是被判为"被别的会话打断"而自动暂停 —— 自己不会恢复。这里做两件事：
+// 顶层把音轨从播放器项里去掉（vcamMakeVideoOnlyItem），看门狗当第二道保险。
+// 日志里每补一次 play 都留痕，下一轮就能从日志看出到底有没有被打断。
+static void vcamPlayerWatchdog(void) {
+    AVPlayer *p = g_maskPlayer;
+    if (!p) return;
+    AVPlayerItem *ci = p.currentItem;
+    if (!ci || ci.status != AVPlayerItemStatusReadyToPlay) return;
+
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+
+    // seek 回调要是没回来（被拆播放器/异常），别把 s_rewinding 永久卡住
+    if (s_rewinding) {
+        if (now - s_rewindStart > 2.0) {
+            VCamLog(@"回零 seek 超过 2 秒没回调，强制解锁");
+            s_rewinding = NO;
+        }
+        return;
+    }
+
+    if (p.rate > 0) return;      // 正在播，什么都不用做
+    // 1 = 在等缓冲/等别的条件（WaitingToPlayAtSpecifiedRate），它自己会继续，插一脚反而打乱。
+    // 这里不写枚举名而写数值：那个枚举在 SDK 里改过名，踩上废弃标注就是 -Werror 卡构建，
+    // 而数值是稳定的 ABI，日志里也会把原始数值打出来。
+    if (p.timeControlStatus == 1) return;
+
+    CMTime dur = ci.duration;
+    CMTime cur = p.currentTime;
+    if (CMTIME_IS_VALID(dur) && CMTimeGetSeconds(dur) > 0.4 &&
+        CMTimeGetSeconds(CMTimeSubtract(dur, cur)) < 0.35) {
+        vcamRewindAndPlay(p);    // 停在结尾：该回零而不是 play
+        return;
+    }
+
+    if (now - s_lastKick < 1.0) return;    // 限流：最多每秒补一次
+    s_lastKick = now;
+    s_kicks++;
+    if (s_kicks <= 5 || s_kicks % 20 == 0) {
+        VCamLog(@"画面定格：rate=0 状态=%ld 位置=%.2f/%.2f，第 %d 次补 play",
+                (long)p.timeControlStatus, CMTimeGetSeconds(cur),
+                CMTimeGetSeconds(dur), s_kicks);
+    }
+    [p play];
+}
+
+// 造一个"只有视频轨"的播放器项。
+//
+// 为什么不能直接把 URL 交给 AVPlayer：资源里有音轨时 AVPlayer 就会碰 AVAudioSession，
+// 而相机进录像模式会把会话切成 PlayAndRecord，播放器被判为"被打断"就停在原地不动
+// （屏幕上正是用户看到的"录像模式画面静止"；拍照模式不动音频会话，所以那边一直能动）。
+// 把音轨从播放器项里摘掉，播放器就不会再去动音频会话。
+//
+// 读轨道必须用 iOS15+ 的异步接口：同步的 tracksWithMediaType: 在 17.5 SDK 里已废弃，
+// 开着 -Werror 会直接卡构建。它在别的线程回调，所以这里只组装，起播放器要回主线程。
+// 任何一步不成就退回"按原文件播"，绝不因为这一步做不成而没有画面。
+static void vcamMakeVideoOnlyItem(NSURL *url, void (^done)(AVPlayerItem *item, NSString *note)) {
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:nil];
+    [asset loadTracksWithMediaType:AVMediaTypeVideo
+                 completionHandler:^(NSArray<AVAssetTrack *> * _Nullable tracks,
+                                     NSError * _Nullable error) {
+        AVPlayerItem *item = nil;
+        NSString *note = nil;
+        AVAssetTrack *vt = tracks.firstObject;
+        AVMutableComposition *comp = nil;
+
+        if (vt) {
+            comp = [AVMutableComposition composition];
+            AVMutableCompositionTrack *ct =
+                [comp addMutableTrackWithMediaType:AVMediaTypeVideo
+                                preferredTrackID:kCMPersistentTrackID_Invalid];
+            NSError *e = nil;
+            // 时长取轨道自己的 timeRange（不用 AVAsset.duration，那个在 17.5 里已废弃）
+            if (ct && [ct insertTimeRange:CMTimeRangeMake(kCMTimeZero, vt.timeRange.duration)
+                                  ofTrack:vt atTime:kCMTimeZero error:&e]) {
+                // 构图轨道不会自动继承原轨道的方向信息（竖屏视频常靠 preferredTransform
+                // 摆正）。漏了这行，本来竖着拍的视频会被摆横。
+                // 用 KVC 取这个结构体属性：万一它在 17.5 SDK 里被标了废弃，直接写属性名
+                // 就会卡构建，而 KVC 取不到只是少一次摆正，不会崩。
+                id tf = vcamValueIfResponds(vt, @selector(preferredTransform));
+                if ([tf isKindOfClass:[NSValue class]]) {
+                    ct.preferredTransform = [(NSValue *)tf CGAffineTransformValue];
+                } else {
+                    VCamLog(@"取不到原视频的方向信息，按不旋转播放");
+                }
+                item = [AVPlayerItem playerItemWithAsset:comp];
+                note = @"已剥掉音轨（不让播放器碰音频会话）";
+            } else {
+                note = [NSString stringWithFormat:@"音轨剥离失败（%@），按原文件播",
+                        e.localizedDescription ?: @"?"];
+            }
+        } else {
+            note = [NSString stringWithFormat:@"没读到视频轨（%@），按原文件播",
+                    error.localizedDescription ?: @"?"];
+        }
+
+        if (!item) item = [AVPlayerItem playerItemWithURL:url];
+        dispatch_async(dispatch_get_main_queue(), ^{ done(item, note); });
     }];
 }
 
 static void vcamStartPlayerAttempt(NSString *sharedPath, NSString *playPath, int attempt);
+static void vcamBeginPlayback(NSString *sharedPath, NSString *playPath, int attempt,
+                              AVPlayerItem *item, NSString *note);
 
 // 先拷一份到本进程自己的容器里再播。AVPlayer 的解码在进程外做（mediaserverd），
 // 共享目录 /var/tmp/VCam 那种位置它未必有权限 —— 症状正好是我们踩到的：播放器
@@ -545,11 +713,21 @@ static void vcamStartPlayer(NSString *sharedPath) {
     });
 }
 
-// 主线程
+// 主线程。先拆旧的，再异步造"只有视频轨"的播放器项，项造好了才真正起播放器
+// （造项走的是异步接口，这一步不能再按同步流程写）。
 static void vcamStartPlayerAttempt(NSString *sharedPath, NSString *playPath, int attempt) {
     vcamTeardownPlayer();
+    int gen = g_playGen;      // teardown 会 ++g_playGen，所以这里记的才是"本次"的代号
+    vcamMakeVideoOnlyItem([NSURL fileURLWithPath:playPath],
+                          ^(AVPlayerItem *item, NSString *note) {
+        if (gen != g_playGen) return;    // 等项这会儿开关关了/换了视频，本次作废
+        vcamBeginPlayback(sharedPath, playPath, attempt, item, note);
+    });
+}
 
-    AVPlayerItem *item = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:playPath]];
+// 主线程。注意这个函数的执行时机不再紧跟 vcamStartPlayerAttempt，中间隔着一次异步加载。
+static void vcamBeginPlayback(NSString *sharedPath, NSString *playPath, int attempt,
+                              AVPlayerItem *item, NSString *note) {
     // 注意是 initWithPlayerItem:（不是 initWithItem:），上一轮 AVQueuePlayer 也是栽在
     // 这类"想当然的初始化方法"上。这里用 alloc/init 而不是 +playerWithPlayerItem:，
     // 少绕一层类方法查找
@@ -558,11 +736,13 @@ static void vcamStartPlayerAttempt(NSString *sharedPath, NSString *playPath, int
     // （空队列版、把模板塞进队列版）时钟都不走，画面定在第一帧 —— 铁证是三张
     // "假照片"字节数完全相同，说明每次取到的都是同一帧。循环自己做。
     p.actionAtItemEnd = AVPlayerActionAtItemEndNone;
-    p.muted = YES;      // 假画面不该出声，也避开跟相机的录音会话抢音频通道
+    p.muted = YES;      // 假画面不该出声；音轨在造项时已经剥掉了
+    VCamLog(@"播放器项：%@", note ?: @"(无说明)");
 
     g_maskPlayer = p;
     g_playingPath = [sharedPath copy];
     g_playerTicks = 0;
+    s_kicks = 0;
 
     __weak AVPlayer *wp = p;
     g_timeObserver = [p addPeriodicTimeObserverForInterval:CMTimeMake(1, 4)
@@ -581,7 +761,16 @@ static void vcamStartPlayerAttempt(NSString *sharedPath, NSString *playPath, int
         addObserverForName:AVPlayerItemDidPlayToEndTimeNotification
                     object:item
                      queue:[NSOperationQueue mainQueue]
-                usingBlock:^(NSNotification *note) { vcamRewindAndPlay(wp); }];
+                usingBlock:^(NSNotification *n) { (void)n; vcamRewindAndPlay(wp); }];
+
+    // 看门狗跟播放器同生共死（拆播放器时 invalidate），0.5s 一跳
+    if (g_watchdog) {
+        [g_watchdog invalidate];
+        g_watchdog = nil;
+    }
+    g_watchdog = [NSTimer scheduledTimerWithTimeInterval:0.5
+                                                 repeats:YES
+                                                   block:^(NSTimer *t) { vcamPlayerWatchdog(); }];
 
     [p play];
 
@@ -592,8 +781,8 @@ static void vcamStartPlayerAttempt(NSString *sharedPath, NSString *playPath, int
         if (g_maskPlayer != p) return;      // 这期间被换掉或关掉了
 
         AVPlayerItem *ci = p.currentItem;
-        VCamLog(@"播放器体检：时钟=%d 拍 item.status=%ld 时长=%.2f 位置=%.2f 播放状态=%ld 等待原因=%@ 错误=%@",
-                g_playerTicks, (long)ci.status,
+        VCamLog(@"播放器体检：时钟=%d 拍 补play=%d 次 item.status=%ld 时长=%.2f 位置=%.2f 播放状态=%ld 等待原因=%@ 错误=%@",
+                g_playerTicks, s_kicks, (long)ci.status,
                 CMTimeGetSeconds(ci.duration), CMTimeGetSeconds(p.currentTime),
                 (long)p.timeControlStatus,
                 p.reasonForWaitingToPlay ?: @"-",
@@ -1354,8 +1543,13 @@ static void vcamInstallPhotoDelegateHooks(id delegate) {
 // （它当然实现了），调用就绕过基类，我们的 hook 一次都不会触发 ——
 // 日志里 startRecording 从头到尾没出现过，很可能就是这么来的，而不是"相机不用它"。
 // 改成按类名各自挂，两个类都挂上，谁实现就命中谁。
-static void vcamDidStartRecording(id self, SEL _cmd, AVCaptureFileOutput *output,
-                                  NSURL *outputFileURL,
+//
+// 参数个数务必按真实方法写：`-startRecordingToOutputFileURL:recordingDelegate:`
+// 只有 (URL, delegate) 两个参数。这里曾经多写了一个 AVCaptureFileOutput*（把它当成
+// 代理回调那条三参数的形状了），结果 URL 被当成 output、delegate 被当成 URL、
+// 真正的 delegate 拿到的是寄存器里的垃圾值 —— 相机一开始录像就 SIGBUS，
+// 崩溃栈停在 objc_retain，地址 0x1。
+static void vcamDidStartRecording(id self, SEL _cmd, NSURL *outputFileURL,
                                   id<AVCaptureFileOutputRecordingDelegate> delegate) {
     g_recordingURL = outputFileURL;
     VCamLog(@"开始录像 -> %@（%@）", outputFileURL.path,
@@ -1364,8 +1558,7 @@ static void vcamDidStartRecording(id self, SEL _cmd, AVCaptureFileOutput *output
 
     IMP orig = vcamLookupOrig(self, _cmd);
     if (orig) {
-        ((void (*)(id, SEL, AVCaptureFileOutput *, NSURL *, id))orig)(
-            self, _cmd, output, outputFileURL, delegate);
+        ((void (*)(id, SEL, NSURL *, id))orig)(self, _cmd, outputFileURL, delegate);
     }
 }
 
