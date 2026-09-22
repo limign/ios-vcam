@@ -550,7 +550,9 @@ static void vcamStartPlayerAttempt(NSString *sharedPath, NSString *playPath, int
     vcamTeardownPlayer();
 
     AVPlayerItem *item = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:playPath]];
-    AVPlayer *p = [AVPlayer playerWithItem:item];
+    // 没有 +playerWithItem: 这个类方法（上一轮 AVQueuePlayer 也是栽在这类"想当然的工厂方法"上），
+    // 直接用 alloc/init，省得再猜一次
+    AVPlayer *p = [[AVPlayer alloc] initWithItem:item];
     // 不用 AVQueuePlayer + AVPlayerLooper：实测这台设备上 looper 的两个版本
     // （空队列版、把模板塞进队列版）时钟都不走，画面定在第一帧 —— 铁证是三张
     // "假照片"字节数完全相同，说明每次取到的都是同一帧。循环自己做。
@@ -1403,9 +1405,15 @@ static void vcamNoteWriterStart(AVAssetWriter *w) {
     for (AVAssetWriterInput *inp in w.inputs) {
         [kinds addObject:inp.mediaType ?: @"?"];
     }
-    VCamLogOnce([NSString stringWithFormat:@"writer:%@", w.outputFileURL.path ?: @"?"],
+    // 注意：AVAssetWriter 公开接口里没有 outputFileURL（只有 outputFileType / inputs），
+    // 所以这里不能写属性 —— 上一轮就是这么挂的。目标文件路径对排查很有用，
+    // 但只能当"有就记、没有就算了"的可选信息，而且取值必须先判类型再用。
+    id outURL = vcamValueIfResponds(w, @selector(outputFileURL));
+    NSString *path = [outURL isKindOfClass:[NSURL class]] ? [(NSURL *)outURL path]
+                                                          : [outURL description];
+    VCamLogOnce([NSString stringWithFormat:@"writer:%@", path ?: @"?"],
                 [NSString stringWithFormat:@"写入端：AVAssetWriter 开始写 %@ 容器=%@ 输入=%@",
-                 w.outputFileURL.path, w.outputFileType, kinds]);
+                 path ?: @"(未知)", w.outputFileType, kinds]);
 }
 
 static void vcamNoteWriterInput(id input, AVMediaType mediaType, NSDictionary *outputSettings,
