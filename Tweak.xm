@@ -2,6 +2,8 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
+#import <ImageIO/ImageIO.h>
+#import <objc/runtime.h>
 #import <substrate.h>
 #import "MediaManager.h"
 
@@ -181,7 +183,13 @@ static BOOL vcamReadSharedState(BOOL *enabled, NSString **path);
 // 中途没有我们能插手的 sample buffer，所以只能事后覆盖 —— 记住目标 URL，
 // 等录制结束、文件定型之后，把我们的视频拷过去。
 static NSURL *g_recordingURL = nil;
-static NSMutableDictionary *g_recordOrigIMPs = nil;   // 代理类名 -> 原 IMP
+
+// 代理类 -> 原 IMP。用 C 数组而不是 NSValue 存：本文件按 ObjC++ 编译，
+// 函数指针与 void* 之间不能隐式转换，塞进 NSValue 需要一堆 reinterpret_cast。
+#define VCAM_MAX_RECORD_HOOKS 8
+static Class g_recordHookClasses[VCAM_MAX_RECORD_HOOKS] = {NULL};
+static IMP   g_recordHookOrigs[VCAM_MAX_RECORD_HOOKS]   = {NULL};
+static int   g_recordHookCount = 0;
 
 // 把录下来的文件换成我们的视频。重复调用无害（目标已存在就先删再拷），
 // 失败只记日志不抛，绝不能影响录像本身。
@@ -208,9 +216,13 @@ static void vcamDidFinishRecording(id self, SEL _cmd, AVCaptureFileOutput *outpu
 
     Class cls = object_getClass(self);
     IMP orig = NULL;
-    while (cls && !orig) {
-        orig = [g_recordOrigIMPs[NSStringFromClass(cls)] pointerValue];
-        cls = class_getSuperclass(cls);
+    for (; cls && !orig; cls = class_getSuperclass(cls)) {
+        for (int i = 0; i < g_recordHookCount; i++) {
+            if (g_recordHookClasses[i] == cls) {
+                orig = g_recordHookOrigs[i];
+                break;
+            }
+        }
     }
     if (orig) {
         ((void (*)(id, SEL, AVCaptureFileOutput *, NSURL *, AVCaptureConnection *, NSError *))orig)(
@@ -222,11 +234,13 @@ static void vcamDidFinishRecording(id self, SEL _cmd, AVCaptureFileOutput *outpu
 // 只能在 startRecording 时按实际对象动态安装。
 static void vcamInstallRecordHook(Class cls) {
     if (!cls) return;
-    if (!g_recordOrigIMPs) g_recordOrigIMPs = [NSMutableDictionary dictionary];
+
+    for (int i = 0; i < g_recordHookCount; i++) {
+        if (g_recordHookClasses[i] == cls) return;
+    }
+    if (g_recordHookCount >= VCAM_MAX_RECORD_HOOKS) return;
 
     NSString *key = NSStringFromClass(cls);
-    if (g_recordOrigIMPs[key]) return;
-
     SEL sel = @selector(captureOutput:didFinishRecordingToOutputFileAtURL:fromConnection:error:);
     if (!class_getInstanceMethod(cls, sel)) {
         VCamLog(@"录像代理 %@ 没实现 didFinishRecording，跳过 hook", key);
@@ -236,7 +250,9 @@ static void vcamInstallRecordHook(Class cls) {
     IMP orig = NULL;
     MSHookMessageEx(cls, sel, (IMP)vcamDidFinishRecording, &orig);
     if (orig) {
-        g_recordOrigIMPs[key] = [NSValue valueWithPointer:orig];
+        g_recordHookClasses[g_recordHookCount] = cls;
+        g_recordHookOrigs[g_recordHookCount] = orig;
+        g_recordHookCount++;
         VCamLog(@"已给录像代理 %@ 装上 didFinishRecording hook", key);
     }
 }
@@ -392,15 +408,16 @@ static void vcamStartPlayer(NSString *path) {
     vcamTeardownPlayer();
 
     NSURL *url = [NSURL fileURLWithPath:path];
-    AVPlayerItem *template = [AVPlayerItem playerItemWithURL:url];
+    // 变量名别叫 template —— 本文件按 ObjC++ 编译，那是 C++ 关键字
+    AVPlayerItem *templateItem = [AVPlayerItem playerItemWithURL:url];
 
     // 循环用 AVPlayerLooper（配 AVQueuePlayer）。之前是自己监听
     // AVPlayerItemDidPlayToEndTimeNotification 再 seek 回零，实测播完就停 ——
     // 那个通知依赖 item 真的走到结尾，且 seek 与 play 的时序容易丢，
     // 交给系统这个专门做无缝循环的 API 更可靠。
-    AVQueuePlayer *queuePlayer = [AVQueuePlayer queuePlayerWithItems:@[template]];
+    AVQueuePlayer *queuePlayer = [AVQueuePlayer queuePlayerWithItems:@[templateItem]];
     queuePlayer.actionAtItemEnd = AVPlayerActionAtItemEndAdvance;
-    g_looper = [AVPlayerLooper playerLooperWithPlayer:queuePlayer templateItem:template];
+    g_looper = [AVPlayerLooper playerLooperWithPlayer:queuePlayer templateItem:templateItem];
 
     g_maskPlayer = queuePlayer;
     g_playingPath = [path copy];
@@ -444,6 +461,22 @@ static CGImageRef vcamCopyCurrentFrameImage(void) {
     return img;
 }
 
+// CGImage -> JPEG。不走 UIImage（相关的便捷方法在这个 SDK 里不齐），
+// 直接用 ImageIO。UTI 写死字符串而不引 kUTTypeJPEG：后者已废弃，
+// 而本项目开了 -Werror，一个弃用警告就能让构建失败。
+static NSData *vcamEncodeJPEG(CGImageRef img, CGFloat quality) {
+    NSMutableData *out = [NSMutableData data];
+    CGImageDestinationRef dest = CGImageDestinationCreateWithData(
+        (__bridge CFMutableDataRef)out, CFSTR("public.jpeg"), 1, NULL);
+    if (!dest) return nil;
+
+    NSDictionary *opts = @{ (id)kCGImageDestinationLossyCompressionQuality: @(quality) };
+    CGImageDestinationAddImage(dest, img, (__bridge CFDictionaryRef)opts);
+    BOOL ok = CGImageDestinationFinalize(dest);
+    CFRelease(dest);
+    return ok ? out : nil;
+}
+
 static NSData *vcamFakePhotoData(void) {
     if (!g_vcamEnabled || !g_maskPlayer || g_playingPath.length == 0) return nil;
 
@@ -453,9 +486,9 @@ static NSData *vcamFakePhotoData(void) {
         return nil;
     }
 
-    UIImage *ui = [UIImage imageWithCGImage:img];
+    NSData *jpeg = vcamEncodeJPEG(img, 0.92);
     CGImageRelease(img);
-    NSData *jpeg = [ui jpegDataWithCompressionQuality:0.92];
+
     if (jpeg) {
         static BOOL logged = NO;
         if (!logged) {
