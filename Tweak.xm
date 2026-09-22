@@ -5,7 +5,6 @@
 #import <ImageIO/ImageIO.h>
 #import <objc/runtime.h>
 #import <substrate.h>
-#import "MediaManager.h"
 
 #pragma mark 日志（设备无 syslog，状态只能写文件后远程读）
 static NSString *g_logPath = nil;
@@ -152,7 +151,6 @@ static NSArray *vcamSharedCandidates(void) {
 }
 
 #pragma mark 全局变量
-static NSMutableArray* g_allVideoDelegates = nil;
 static BOOL g_vcamEnabled = NO;              // 本进程视角的开关，由共享状态驱动
 static VCamOverlayWindow *g_overlayWindow = nil;
 static UIButton *g_floatButton = nil;
@@ -184,12 +182,57 @@ static BOOL vcamReadSharedState(BOOL *enabled, NSString **path);
 // 等录制结束、文件定型之后，把我们的视频拷过去。
 static NSURL *g_recordingURL = nil;
 
-// 代理类 -> 原 IMP。用 C 数组而不是 NSValue 存：本文件按 ObjC++ 编译，
-// 函数指针与 void* 之间不能隐式转换，塞进 NSValue 需要一堆 reinterpret_cast。
-#define VCAM_MAX_RECORD_HOOKS 8
-static Class g_recordHookClasses[VCAM_MAX_RECORD_HOOKS] = {NULL};
-static IMP   g_recordHookOrigs[VCAM_MAX_RECORD_HOOKS]   = {NULL};
-static int   g_recordHookCount = 0;
+// 动态 hook 的登记表。代理类由 App 决定、事先不可知，只能拿到对象后再按实际类装。
+// 用 C 数组而不是 NSValue 存：本文件按 ObjC++ 编译，函数指针与 void* 之间不能
+// 隐式转换，塞 NSValue 需要一堆 reinterpret_cast。
+#define VCAM_MAX_HOOKS 8
+typedef struct { Class cls; IMP orig; } VCamHookSlot;
+static VCamHookSlot g_hookSlots[VCAM_MAX_HOOKS];
+static int g_hookCount = 0;
+
+static BOOL vcamIsHooked(Class cls) {
+    for (int i = 0; i < g_hookCount; i++) {
+        if (g_hookSlots[i].cls == cls) return YES;
+    }
+    return NO;
+}
+
+static BOOL vcamRememberHook(Class cls, IMP orig) {
+    if (!cls || !orig || g_hookCount >= VCAM_MAX_HOOKS) return NO;
+    g_hookSlots[g_hookCount].cls = cls;
+    g_hookSlots[g_hookCount].orig = orig;
+    g_hookCount++;
+    return YES;
+}
+
+// 沿继承链找这个对象所属类被 hook 时记下的原 IMP
+static IMP vcamLookupOrig(id obj) {
+    for (Class c = object_getClass(obj); c; c = class_getSuperclass(c)) {
+        for (int i = 0; i < g_hookCount; i++) {
+            if (g_hookSlots[i].cls == c) return g_hookSlots[i].orig;
+        }
+    }
+    return NULL;
+}
+
+// 找到真正实现 sel 的那一层类并 hook。不能直接拿 class_getInstanceMethod 的结果
+// 去下手：它返回的是继承来的方法，会给一个本来没实现该方法的类平白加上一个方法，
+// 拿到的原 IMP 也不是那一层自己的。所以要逐层比对实现指针，只挑"和父类不同"的层。
+static BOOL vcamHookImplementation(id obj, SEL sel, IMP hook) {
+    if (!obj) return NO;
+    for (Class c = object_getClass(obj); c; c = class_getSuperclass(c)) {
+        Method m = class_getInstanceMethod(c, sel);
+        if (!m) return NO;
+        Method up = class_getInstanceMethod(class_getSuperclass(c), sel);
+        if (!up || method_getImplementation(m) != method_getImplementation(up)) {
+            if (vcamIsHooked(c)) return YES;
+            IMP orig = NULL;
+            MSHookMessageEx(c, sel, hook, &orig);
+            return vcamRememberHook(c, orig);
+        }
+    }
+    return NO;
+}
 
 // 把录下来的文件换成我们的视频。重复调用无害（目标已存在就先删再拷），
 // 失败只记日志不抛，绝不能影响录像本身。
@@ -214,46 +257,24 @@ static void vcamDidFinishRecording(id self, SEL _cmd, AVCaptureFileOutput *outpu
                                    NSError *error) {
     vcamReplaceRecordedFile(outputFileURL);
 
-    Class cls = object_getClass(self);
-    IMP orig = NULL;
-    for (; cls && !orig; cls = class_getSuperclass(cls)) {
-        for (int i = 0; i < g_recordHookCount; i++) {
-            if (g_recordHookClasses[i] == cls) {
-                orig = g_recordHookOrigs[i];
-                break;
-            }
-        }
-    }
+    IMP orig = vcamLookupOrig(self);
     if (orig) {
         ((void (*)(id, SEL, AVCaptureFileOutput *, NSURL *, AVCaptureConnection *, NSError *))orig)(
             self, _cmd, output, outputFileURL, connection, error);
     }
 }
 
-// 给录像代理的类装上回调 hook。代理类由 App 决定且事先不可知，
-// 只能在 startRecording 时按实际对象动态安装。
-static void vcamInstallRecordHook(Class cls) {
-    if (!cls) return;
-
-    for (int i = 0; i < g_recordHookCount; i++) {
-        if (g_recordHookClasses[i] == cls) return;
-    }
-    if (g_recordHookCount >= VCAM_MAX_RECORD_HOOKS) return;
-
-    NSString *key = NSStringFromClass(cls);
+// 给录像代理装上回调 hook，按实际对象的类动态安装。
+static void vcamInstallRecordHook(id delegate) {
+    if (!delegate) return;
+    Class cls = object_getClass(delegate);
     SEL sel = @selector(captureOutput:didFinishRecordingToOutputFileAtURL:fromConnection:error:);
     if (!class_getInstanceMethod(cls, sel)) {
-        VCamLog(@"录像代理 %@ 没实现 didFinishRecording，跳过 hook", key);
+        VCamLog(@"录像代理 %@ 没实现 didFinishRecording，跳过 hook", NSStringFromClass(cls));
         return;
     }
-
-    IMP orig = NULL;
-    MSHookMessageEx(cls, sel, (IMP)vcamDidFinishRecording, &orig);
-    if (orig) {
-        g_recordHookClasses[g_recordHookCount] = cls;
-        g_recordHookOrigs[g_recordHookCount] = orig;
-        g_recordHookCount++;
-        VCamLog(@"已给录像代理 %@ 装上 didFinishRecording hook", key);
+    if (vcamHookImplementation(delegate, sel, (IMP)vcamDidFinishRecording)) {
+        VCamLog(@"已给录像代理 %@ 装上 didFinishRecording hook", NSStringFromClass(cls));
     }
 }
 
@@ -393,6 +414,19 @@ static void vcamWriteSharedState(BOOL enabled, NSString *videoPath) {
 
 #pragma mark 播放器与覆盖层
 
+// 采集注入用的帧缓存（+1 持有）。视频一换就作废。
+// 它是 CF 对象、引用计数由我们手管，而采集回调在 App 的采集队列上、作废在主线程上，
+// 所以这里必须上锁 —— 否则换视频时可能把它释放两次。
+static CGImageRef g_bufFrameCache = NULL;
+static CMTime g_bufFrameCacheTime = kCMTimeInvalid;
+
+static NSLock *vcamFrameCacheLock(void) {
+    static NSLock *lock = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [[NSLock alloc] init]; });
+    return lock;
+}
+
 // 主线程
 static void vcamTeardownPlayer(void) {
     if (g_maskPlayer) {
@@ -401,6 +435,15 @@ static void vcamTeardownPlayer(void) {
     }
     g_looper = nil;
     g_playingPath = nil;
+
+    NSLock *lock = vcamFrameCacheLock();
+    [lock lock];
+    if (g_bufFrameCache) {
+        CGImageRelease(g_bufFrameCache);
+        g_bufFrameCache = NULL;
+    }
+    g_bufFrameCacheTime = kCMTimeInvalid;
+    [lock unlock];
 }
 
 // 主线程
@@ -411,11 +454,11 @@ static void vcamStartPlayer(NSString *path) {
     // 变量名别叫 template —— 本文件按 ObjC++ 编译，那是 C++ 关键字
     AVPlayerItem *templateItem = [AVPlayerItem playerItemWithURL:url];
 
-    // 循环用 AVPlayerLooper（配 AVQueuePlayer）。之前是自己监听
-    // AVPlayerItemDidPlayToEndTimeNotification 再 seek 回零，实测播完就停 ——
-    // 那个通知依赖 item 真的走到结尾，且 seek 与 play 的时序容易丢，
-    // 交给系统这个专门做无缝循环的 API 更可靠。
-    AVQueuePlayer *queuePlayer = [AVQueuePlayer queuePlayerWithItems:@[templateItem]];
+    // 循环用 AVPlayerLooper。队列必须建造成空的：looper 只把 templateItem 当模板，
+    // 自己往队列里插副本（文档原话是它不会参与实际播放）。上一版把 templateItem
+    // 塞进 queuePlayerWithItems: 一起交出去，结果队列里那个只当模板的 item 反而
+    // 排在前面，画面就定在第一帧不动 —— 所以这里改成空队列。
+    AVQueuePlayer *queuePlayer = [AVQueuePlayer queuePlayer];
     queuePlayer.actionAtItemEnd = AVPlayerActionAtItemEndAdvance;
     g_looper = [AVPlayerLooper playerLooperWithPlayer:queuePlayer templateItem:templateItem];
 
@@ -423,35 +466,81 @@ static void vcamStartPlayer(NSString *path) {
     g_playingPath = [path copy];
 
     [g_maskPlayer play];
+
+    // 起播后回看一眼。画面定格这种毛病光看"开始播放"那行是分不出来的：
+    // items 里到底有没有 looper 插进去的副本、rate 有没有真起来，得拉出来看。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (g_maskPlayer != queuePlayer) return;    // 这期间被换掉或关掉了
+
+        AVQueuePlayer *qp = (AVQueuePlayer *)g_maskPlayer;
+        VCamLog(@"播放器回看 items=%lu rate=%.1f（item 本身 status=%ld）",
+                (unsigned long)qp.items.count, (double)g_maskPlayer.rate,
+                (long)templateItem.status);
+        if (qp.items.count > 0 && g_maskPlayer.rate > 0.0) return;
+
+        // looper 没把副本放进队列，或者播放器压根没起来。退回普通播放器：
+        // 画面定格不动比"只播一遍"严重得多，先保证它是动的。
+        VCamLog(@"looper 未生效，退回普通播放器（不循环）");
+        g_looper = nil;
+        AVPlayer *plain = [AVPlayer playerWithURL:url];
+        g_maskPlayer = plain;
+        [plain play];
+    });
+
     VCamLog(@"开始播放（循环）%@（本进程已登记预览层 %lu 个）",
             path, (unsigned long)g_previewLayers.count);
 }
 
-#pragma mark 当前帧取样（拍照替换用）
+#pragma mark 当前帧取样
 
 // 拍到的仍是真实画面：预览层覆盖只改了「显示」，采集数据没动。
-// 要改采集结果，只能在 App 取图时把它换掉 —— 见文件末尾 AVCapturePhoto 的 hook。
+// 要改采集结果，得在采集链路上把帧换掉 —— 见下面「采集帧注入」一节。
 static AVAssetImageGenerator *g_imageGen = nil;
 static NSString *g_imageGenPath = nil;
+static AVAssetImageGenerator *g_bufGen = nil;      // 采集注入专用：限了尺寸，每帧都要跑
+static NSString *g_bufGenPath = nil;
 static CVPixelBufferRef g_lastFakePixelBuffer = NULL;
 
-static AVAssetImageGenerator *vcamImageGenerator(void) {
+static AVAssetImageGenerator *vcamMakeGenerator(CGFloat maxSide) {
     if (g_playingPath.length == 0) return nil;
-    if (g_imageGen && [g_imageGenPath isEqualToString:g_playingPath]) return g_imageGen;
 
     AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:g_playingPath]];
     if (!asset) return nil;
-    g_imageGen = [AVAssetImageGenerator assetImageGeneratorWithAsset:asset];
-    g_imageGen.appliesPreferredTrackTransform = YES;
-    g_imageGen.requestedTimeToleranceBefore = kCMTimeZero;
-    g_imageGen.requestedTimeToleranceAfter = kCMTimeZero;
-    g_imageGenPath = [g_playingPath copy];
+    AVAssetImageGenerator *gen = [AVAssetImageGenerator assetImageGeneratorWithAsset:asset];
+    gen.appliesPreferredTrackTransform = YES;
+    if (maxSide > 0) {
+        gen.maximumSize = CGSizeMake(maxSide, maxSide);
+    } else {
+        // 拍照要的是成品，取精确帧
+        gen.requestedTimeToleranceBefore = kCMTimeZero;
+        gen.requestedTimeToleranceAfter = kCMTimeZero;
+    }
+    return gen;
+}
+
+static AVAssetImageGenerator *vcamImageGenerator(void) {
+    if (g_imageGen && [g_imageGenPath isEqualToString:g_playingPath]) return g_imageGen;
+    g_imageGen = vcamMakeGenerator(0);
+    g_imageGenPath = g_playingPath ? [g_playingPath copy] : nil;
     return g_imageGen;
 }
 
-// 取播放头当前位置的那一帧。+1 的 CGImage，调用方负责 CGImageRelease；失败返回 NULL
-static CGImageRef vcamCopyCurrentFrameImage(void) {
-    AVAssetImageGenerator *gen = vcamImageGenerator();
+// 采集路径每帧都要取一次图，解码成本必须压住：限到 960x540（假画面够看了）
+// 并允许 ±1/15 秒的取帧误差，这样生成器能就近取帧而不必精确解码每一帧。
+static AVAssetImageGenerator *vcamBufferImageGenerator(void) {
+    if (g_bufGen && [g_bufGenPath isEqualToString:g_playingPath]) return g_bufGen;
+    g_bufGen = vcamMakeGenerator(960);
+    if (g_bufGen) {
+        g_bufGen.requestedTimeToleranceBefore = CMTimeMake(1, 15);
+        g_bufGen.requestedTimeToleranceAfter = CMTimeMake(1, 15);
+    }
+    g_bufGenPath = g_playingPath ? [g_playingPath copy] : nil;
+    return g_bufGen;
+}
+
+// 取指定生成器在播放头位置的帧。+1 的 CGImage，调用方负责 CGImageRelease
+static CGImageRef vcamCopyFrameFrom(AVAssetImageGenerator *gen) {
     if (!gen) return NULL;
 
     CMTime t = g_maskPlayer ? g_maskPlayer.currentTime : kCMTimeZero;
@@ -459,6 +548,10 @@ static CGImageRef vcamCopyCurrentFrameImage(void) {
     // 播放头正好卡在结尾时会取不到，退回第一帧，总比让 App 拿到真图好
     if (!img) img = [gen copyCGImageAtTime:kCMTimeZero actualTime:NULL error:NULL];
     return img;
+}
+
+static CGImageRef vcamCopyCurrentFrameImage(void) {
+    return vcamCopyFrameFrom(vcamImageGenerator());
 }
 
 // CGImage -> JPEG。不走 UIImage（相关的便捷方法在这个 SDK 里不齐），
@@ -499,6 +592,114 @@ static NSData *vcamFakePhotoData(void) {
     return jpeg;
 }
 
+#pragma mark 像素缓冲工具
+
+static CVPixelBufferRef vcamCreatePixelBuffer(size_t w, size_t h, OSType pf) {
+    NSDictionary *attrs = @{
+        (id)kCVPixelBufferCGImageCompatibilityKey: @YES,
+        (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+    };
+    CVPixelBufferRef pb = NULL;
+    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, pf,
+                            (__bridge CFDictionaryRef)attrs, &pb) != kCVReturnSuccess) {
+        return NULL;
+    }
+    return pb;
+}
+
+// 等比放大到铺满，超出部分裁掉 —— 相机画面被拉伸变形会很怪，宁可靠边裁
+static void vcamDrawFilling(CGContextRef ctx, CGImageRef img, size_t w, size_t h) {
+    CGFloat iw = (CGFloat)CGImageGetWidth(img);
+    CGFloat ih = (CGFloat)CGImageGetHeight(img);
+    if (iw <= 0 || ih <= 0) return;
+    CGFloat scale = MAX((CGFloat)w / iw, (CGFloat)h / ih);
+    CGContextDrawImage(ctx, CGRectMake(((CGFloat)w - iw * scale) / 2.0,
+                                       ((CGFloat)h - ih * scale) / 2.0,
+                                       iw * scale, ih * scale), img);
+}
+
+static BOOL vcamDrawIntoBGRAPixelBuffer(CVPixelBufferRef pb, CGImageRef img) {
+    size_t w = CVPixelBufferGetWidth(pb);
+    size_t h = CVPixelBufferGetHeight(pb);
+    if (CVPixelBufferLockBaseAddress(pb, 0) != kCVReturnSuccess) return NO;
+
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(CVPixelBufferGetBaseAddress(pb), w, h, 8,
+                                            CVPixelBufferGetBytesPerRow(pb), cs,
+                                            kCGImageAlphaPremultipliedFirst |
+                                            kCGBitmapByteOrder32Little);
+    BOOL ok = (ctx != NULL);
+    if (ok) {
+        CGContextSetInterpolationQuality(ctx, kCGInterpolationLow);
+        vcamDrawFilling(ctx, img, w, h);
+        CGContextRelease(ctx);
+    }
+    CGColorSpaceRelease(cs);
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+    return ok;
+}
+
+// BGRA -> 420 双平面。手写而不是引 vImage：少一个框架依赖，也省掉核对那堆
+// vImage 签名（本项目 -Werror，签名叫错一次就是一轮构建白跑）。
+// 420v 是视频范围（16-235），420f 是全范围，系数不同 —— 用反了暗部会被压死，
+// 而且我们复用的是原始 format description，解码方不会替我们纠偏。
+static void vcamConvertBGRAto420(CVPixelBufferRef src, CVPixelBufferRef dst, BOOL fullRange) {
+    size_t w = CVPixelBufferGetWidth(dst);
+    size_t h = CVPixelBufferGetHeight(dst);
+    uint8_t *Y = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dst, 0);
+    size_t Ys = CVPixelBufferGetBytesPerRowOfPlane(dst, 0);
+    uint8_t *C = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dst, 1);
+    size_t Cs = CVPixelBufferGetBytesPerRowOfPlane(dst, 1);
+    const uint8_t *S = (const uint8_t *)CVPixelBufferGetBaseAddress(src);
+    size_t Ss = CVPixelBufferGetBytesPerRow(src);
+    if (!Y || !C || !S) return;
+
+    const int yR = fullRange ? 77 : 66;
+    const int yG = fullRange ? 150 : 129;
+    const int yB = fullRange ? 29 : 25;
+    const int yRound = fullRange ? 0 : 128;
+    const int yBias = fullRange ? 0 : 16;
+
+    for (size_t y = 0; y < h; y++) {
+        const uint8_t *s = S + y * Ss;
+        uint8_t *d = Y + y * Ys;
+        for (size_t x = 0; x < w; x++) {
+            int b = s[x * 4 + 0], g = s[x * 4 + 1], r = s[x * 4 + 2];
+            int v = ((yR * r + yG * g + yB * b + yRound) >> 8) + yBias;
+            d[x] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+        }
+    }
+
+    size_t cw = (w + 1) / 2;
+    size_t ch = (h + 1) / 2;
+    for (size_t cy = 0; cy < ch; cy++) {
+        uint8_t *d = C + cy * Cs;
+        for (size_t cx = 0; cx < cw; cx++) {
+            int rs = 0, gs = 0, bs = 0, n = 0;
+            for (size_t dy = 0; dy < 2; dy++) {
+                size_t yy = cy * 2 + dy;
+                if (yy >= h) break;
+                const uint8_t *s = S + yy * Ss;
+                for (size_t dx = 0; dx < 2; dx++) {
+                    size_t xx = cx * 2 + dx;
+                    if (xx >= w) break;
+                    bs += s[xx * 4 + 0];
+                    gs += s[xx * 4 + 1];
+                    rs += s[xx * 4 + 2];
+                    n++;
+                }
+            }
+            if (!n) continue;
+            int r = rs / n, g = gs / n, b = bs / n;
+            int cb = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
+            int cr = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+            d[cx * 2 + 0] = (uint8_t)(cb < 0 ? 0 : (cb > 255 ? 255 : cb));
+            d[cx * 2 + 1] = (uint8_t)(cr < 0 ? 0 : (cr > 255 ? 255 : cr));
+        }
+    }
+}
+
 static CVPixelBufferRef vcamFakePixelBuffer(void) {
     if (!g_vcamEnabled || !g_maskPlayer || g_playingPath.length == 0) return NULL;
 
@@ -507,29 +708,12 @@ static CVPixelBufferRef vcamFakePixelBuffer(void) {
 
     size_t w = CGImageGetWidth(img);
     size_t h = CGImageGetHeight(img);
-    NSDictionary *attrs = @{
-        (id)kCVPixelBufferCGImageCompatibilityKey: @YES,
-        (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
-    };
-    CVPixelBufferRef pb = NULL;
-    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA,
-                            (__bridge CFDictionaryRef)attrs, &pb) != kCVReturnSuccess || !pb) {
+    CVPixelBufferRef pb = vcamCreatePixelBuffer(w, h, kCVPixelFormatType_32BGRA);
+    if (!pb || !vcamDrawIntoBGRAPixelBuffer(pb, img)) {
+        if (pb) CVPixelBufferRelease(pb);
         CGImageRelease(img);
         return NULL;
     }
-
-    CVPixelBufferLockBaseAddress(pb, 0);
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(CVPixelBufferGetBaseAddress(pb), w, h, 8,
-                                             CVPixelBufferGetBytesPerRow(pb), cs,
-                                             kCGImageAlphaPremultipliedFirst |
-                                             kCGBitmapByteOrder32Little);
-    if (ctx) {
-        CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), img);
-        CGContextRelease(ctx);
-    }
-    CGColorSpaceRelease(cs);
-    CVPixelBufferUnlockBaseAddress(pb, 0);
     CGImageRelease(img);
 
     // -pixelBuffer 这个方法名不表示调用方持有返回值，所以由我们保住这块 buffer，
@@ -537,6 +721,191 @@ static CVPixelBufferRef vcamFakePixelBuffer(void) {
     if (g_lastFakePixelBuffer) CVPixelBufferRelease(g_lastFakePixelBuffer);
     g_lastFakePixelBuffer = pb;
     return g_lastFakePixelBuffer;
+}
+
+#pragma mark 采集帧注入（拍照与录像的真正数据源）
+
+// 这一节是被实测逼出来的。原设计在 AVCapturePhoto 的取值方法上做手脚，日志证明
+// 它确实被调用了（"拍照替换生效：已返回假 JPEG"），但存进相册的仍是真实画面；
+// 与此同时 AVCaptureFileOutput 的 startRecording 一次都没被调用过 —— 系统相机
+// 根本不用 AVCaptureMovieFileOutput。真正出现的是 CAMCaptureEngine 以
+// sampleBuffer 代理的身份注册在 AVCaptureVideoDataOutput 上。
+// 也就是说：拍照和录像的字节都从 sample buffer 流出去，由 App 自己用 AVAssetWriter
+// 写文件（RosyWriter 那套）。所以必须在源头把帧换掉 —— 换在这里，拍照、录像、
+// 以后要支持的第三方 App 通话，一次性全覆盖。
+static CGImageRef vcamCopyBufferFrameImage(void) {
+    AVAssetImageGenerator *gen = vcamBufferImageGenerator();
+    if (!gen) return NULL;
+
+    CMTime t = g_maskPlayer ? g_maskPlayer.currentTime : kCMTimeZero;
+
+    // 采集回调往往比视频帧率还密，播放头没动就没必要重新解码
+    NSLock *lock = vcamFrameCacheLock();
+    [lock lock];
+    CGImageRef cached = NULL;
+    if (g_bufFrameCache && CMTIME_IS_VALID(g_bufFrameCacheTime) &&
+        CMTimeCompare(CMTimeAbsoluteValue(CMTimeSubtract(t, g_bufFrameCacheTime)),
+                      CMTimeMake(1, 30)) < 0) {
+        cached = CGImageRetain(g_bufFrameCache);
+    }
+    [lock unlock];
+    if (cached) return cached;
+
+    CGImageRef img = vcamCopyFrameFrom(gen);   // 解码不持锁，别让主线程陪着等
+    if (img) {
+        [lock lock];
+        if (g_bufFrameCache) CGImageRelease(g_bufFrameCache);
+        g_bufFrameCache = CGImageRetain(img);
+        g_bufFrameCacheTime = t;
+        [lock unlock];
+    }
+    return img;
+}
+
+// 造一个与真实帧同尺寸同格式的假帧，再包成 CMSampleBuffer。
+// format description 直接沿用原始的，所以下游（编码器/写入器）看到的仍然是它认识
+// 的那个格式，不需要为我们的替换改任何设置。任何一步不对就返回 NULL，调用方原样
+// 放行真实帧 —— 插件不能把相机本身搞坏。
+static CMSampleBufferRef vcamMakeFakeSampleBuffer(AVCaptureOutput *output, CMSampleBufferRef orig) {
+    if (!g_vcamEnabled || g_playingPath.length == 0) return NULL;
+    if (![output isKindOfClass:[AVCaptureVideoDataOutput class]]) return NULL;
+
+    CVImageBufferRef origPB = CMSampleBufferGetImageBuffer(orig);
+    if (!origPB) return NULL;      // 音频等没有图像平面的，一律放行
+
+    size_t w = CVPixelBufferGetWidth(origPB);
+    size_t h = CVPixelBufferGetHeight(origPB);
+    OSType pf = CVPixelBufferGetPixelFormatType(origPB);
+    CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(orig);
+    if (!w || !h || !fmt) return NULL;
+
+    CMSampleTimingInfo timing;
+    if (CMSampleBufferGetSampleTimingInfo(orig, 0, &timing) != noErr) return NULL;
+
+    CGImageRef img = vcamCopyBufferFrameImage();
+    if (!img) return NULL;
+
+    CVPixelBufferRef pb = NULL;
+    if (pf == kCVPixelFormatType_32BGRA) {
+        pb = vcamCreatePixelBuffer(w, h, pf);
+        if (pb && !vcamDrawIntoBGRAPixelBuffer(pb, img)) {
+            CVPixelBufferRelease(pb);
+            pb = NULL;
+        }
+    } else if (pf == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+               pf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
+        CVPixelBufferRef rgb = vcamCreatePixelBuffer(w, h, kCVPixelFormatType_32BGRA);
+        if (rgb) {
+            if (vcamDrawIntoBGRAPixelBuffer(rgb, img)) {
+                pb = vcamCreatePixelBuffer(w, h, pf);
+                if (pb) {
+                    CVPixelBufferLockBaseAddress(rgb, kCVPixelBufferLock_ReadOnly);
+                    CVPixelBufferLockBaseAddress(pb, 0);
+                    vcamConvertBGRAto420(rgb, pb,
+                        pf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
+                    CVPixelBufferUnlockBaseAddress(pb, 0);
+                    CVPixelBufferUnlockBaseAddress(rgb, kCVPixelBufferLock_ReadOnly);
+                }
+            }
+            CVPixelBufferRelease(rgb);
+        }
+    }
+    CGImageRelease(img);
+
+    if (!pb) {
+        static int loggedPf = 0;
+        if (loggedPf != (int)pf) {
+            loggedPf = (int)pf;
+            VCamLog(@"采集帧格式 %u 暂不支持替换，真实帧放行", (unsigned)pf);
+        }
+        return NULL;
+    }
+
+    CMSampleBufferRef out = NULL;
+    OSStatus st = CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pb, true, NULL, NULL,
+                                                     fmt, &timing, &out);
+    CVPixelBufferRelease(pb);
+    if (st != noErr || !out) {
+        VCamLog(@"替换 sample buffer 构建失败 st=%d", (int)st);
+        return NULL;
+    }
+
+    static BOOL logged = NO;
+    if (!logged) {
+        logged = YES;
+        VCamLog(@"采集帧注入生效：%lux%lu pf=%u",
+                (unsigned long)w, (unsigned long)h, (unsigned)pf);
+    }
+    return out;    // +1，调用方负责 CFRelease
+}
+
+// 代理的采集回调。这是我们唯一能改到"真正被写进文件的那份数据"的地方。
+static void vcamDidOutputSampleBuffer(id self, SEL _cmd, AVCaptureOutput *output,
+                                      CMSampleBufferRef sampleBuffer, AVCaptureConnection *connection) {
+    IMP orig = vcamLookupOrig(self);
+    if (!orig) return;      // 没记到原实现就什么都不做，绝不吞掉这一帧
+
+    CMSampleBufferRef fake = vcamMakeFakeSampleBuffer(output, sampleBuffer);
+    ((void (*)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *))orig)(
+        self, _cmd, output, fake ? fake : sampleBuffer, connection);
+    if (fake) CFRelease(fake);
+}
+
+static void vcamInstallSampleBufferHook(id delegate) {
+    if (!delegate) return;
+    Class cls = object_getClass(delegate);
+    SEL sel = @selector(captureOutput:didOutputSampleBuffer:fromConnection:);
+    if (!class_getInstanceMethod(cls, sel)) {
+        VCamLog(@"sampleBuffer 代理 %@ 没实现 didOutput，跳过", NSStringFromClass(cls));
+        return;
+    }
+    if (vcamHookImplementation(delegate, sel, (IMP)vcamDidOutputSampleBuffer)) {
+        VCamLog(@"已给 sampleBuffer 代理 %@ 装上注入 hook", NSStringFromClass(cls));
+    }
+}
+
+#pragma mark 假 CGImage（AVCapturePhoto 的另一条取值路径）
+
+// AVCapturePhoto 的约定是 CGImage 由它自己持有、调用方不释放，所以我们也自己攥着，
+// 下次再换时释放旧的。
+static CGImageRef g_lastFakeCGImage = NULL;
+
+static CGImageRef vcamFakeCGImage(void) {
+    if (!g_vcamEnabled || !g_maskPlayer || g_playingPath.length == 0) return NULL;
+
+    CGImageRef src = vcamCopyCurrentFrameImage();
+    if (!src) return NULL;
+
+    size_t w = CGImageGetWidth(src);
+    size_t h = CGImageGetHeight(src);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(NULL, w, h, 8, 0, cs,
+                                            kCGImageAlphaPremultipliedFirst |
+                                            kCGBitmapByteOrder32Little);
+    CGColorSpaceRelease(cs);
+
+    CGImageRef out = NULL;
+    if (ctx) {
+        vcamDrawFilling(ctx, src, w, h);
+        out = CGBitmapContextCreateImage(ctx);
+        CGContextRelease(ctx);
+    }
+    CGImageRelease(src);
+
+    if (out) {
+        if (g_lastFakeCGImage) CGImageRelease(g_lastFakeCGImage);
+        g_lastFakeCGImage = out;
+    }
+    return g_lastFakeCGImage;
+}
+
+// 诊断用：设备上没有 syslog，只能靠日志。同一件事只记一次，免得刷屏。
+static void VCamLogOnce(NSString *tag, NSString *msg) {
+    static NSMutableSet *seen = nil;
+    if (!seen) seen = [NSMutableSet set];
+    if ([seen containsObject:tag]) return;
+    [seen addObject:tag];
+    VCamLog(@"%@", msg);
 }
 
 // 主线程。读共享状态 → 对齐播放器 → 让每个预览层同步覆盖层。
@@ -675,8 +1044,6 @@ static UIViewController *findTopViewController(void) {
     g_selectedVideoUrl = srcUrl;
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
-        [[MediaManager sharedManager] loadMediaFromURL:srcUrl];
-
         // 相册给的这个 URL 指向选择器自己的容器，别的进程没有读权限。
         // 必须复制一份到共享目录，否则「在这个应用里选完、打开相机」相机读不到文件。
         NSString *sharedVideo = nil;
@@ -696,7 +1063,6 @@ static UIViewController *findTopViewController(void) {
         }
 
         dispatch_async(dispatch_get_main_queue(), ^{
-            [[MediaManager sharedManager] start];
             vcamWriteSharedState(YES, sharedVideo ?: srcUrl.path);
             vcamApplySharedState();
             VCamLog(@"视频已加载，虚拟相机开启");
@@ -736,7 +1102,6 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
         BOOL target = !g_vcamEnabled;
 
         if (target) {
-            [[MediaManager sharedManager] start];
             // 本进程没选过视频时，沿用共享状态里已有的那个 —— 开关和视频是两个独立的共享字段，
             // 不能因为这次没重新选片就把之前选好的视频丢掉。
             NSString *existing = nil;
@@ -747,7 +1112,6 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
                 VCamLog(@"已开启，但哪儿都还没有选中的视频，预览不会被替换");
             }
         } else {
-            [[MediaManager sharedManager] stop];
             vcamWriteSharedState(NO, nil);
         }
 
@@ -769,34 +1133,10 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
 %hook AVCaptureVideoDataOutput
 - (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)delegate queue:(dispatch_queue_t)queue {
     %orig;
-    if (!g_allVideoDelegates) g_allVideoDelegates = [NSMutableArray array];
-    if (delegate && ![g_allVideoDelegates containsObject:delegate]) {
-        [g_allVideoDelegates addObject:delegate];
-        VCamLog(@"捕获到 sampleBuffer delegate: %@ (共 %lu 个)",
-                NSStringFromClass([delegate class]), (unsigned long)g_allVideoDelegates.count);
-    }
-}
-%end
-
-%hook NSObject
-- (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection *)connection {
-    if (g_vcamEnabled && [[MediaManager sharedManager] isRunning]) {
-        static BOOL loggedHit = NO;
-        if (!loggedHit) {
-            loggedHit = YES;
-            VCamLog(@"NSObject 层 hook 命中 output=%@", NSStringFromClass([output class]));
-        }
-        CMSampleBufferRef fakeFrame = [[MediaManager sharedManager] nextVideoFrame];
-        if (fakeFrame) {
-            for (id del in g_allVideoDelegates) {
-                if ([del respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
-                    [del captureOutput:output didOutputSampleBuffer:fakeFrame fromConnection:connection];
-                }
-            }
-            return;
-        }
-    }
-    %orig;
+    // 代理类由 App 决定（系统相机是 CAMCaptureEngine），事先不可知，
+    // 只能等它注册上来的时候按实际类装 hook。
+    VCamLog(@"捕获到 sampleBuffer 代理 %@", NSStringFromClass(object_getClass(delegate)));
+    vcamInstallSampleBufferHook(delegate);
 }
 %end
 
@@ -806,38 +1146,58 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
 %end
 
 %hook AVCapturePhotoOutput
-- (void)capturePhotoWithSettings:(AVCapturePhotoSettings *)settings delegate:(id<AVCapturePhotoCaptureDelegate>)delegate { %orig; }
+- (void)capturePhotoWithSettings:(AVCapturePhotoSettings *)settings delegate:(id<AVCapturePhotoCaptureDelegate>)delegate {
+    // processedFileType 的类型在 SDK 里是 AVFileType（NSString*），但为免记错类型
+    // 直接把整数当对象打出来会崩，这里走 KVC 取值 —— 不管它到底是什么都会被装成对象。
+    NSString *key = [NSString stringWithFormat:@"photoDelegate:%@", NSStringFromClass(object_getClass(delegate))];
+    VCamLogOnce(key, [NSString stringWithFormat:@"拍照代理 %@ fileType=%@ uniqueID=%lld",
+                      NSStringFromClass(object_getClass(delegate)),
+                      [settings valueForKey:@"processedFileType"],
+                      (long long)settings.uniqueID]);
+    %orig;
+}
 %end
 
 // 拍照替换。AVCapturePhoto 几乎无法自行构造，只能改它的取值方法，
 // 让 App 从它身上取到的图变成我们生成的。取不到假图时一律回退 %orig，
 // 绝不能让拍照这个基础功能因为插件而失效。
+// 注：实测这几条对系统相机不够（真正被写进文件的是采集链路上的帧，见「采集帧注入」），
+// 但对直接用 AVCapturePhotoOutput 取图的第三方 App 仍然有效，所以留着。
 %hook AVCapturePhoto
 - (NSData *)fileDataRepresentation {
+    VCamLogOnce(@"photo:fileData", @"相机在取 fileDataRepresentation");
     NSData *fake = vcamFakePhotoData();
     if (fake) return fake;
     return %orig;
 }
 - (NSData *)fileDataRepresentationWithCustomizer:(id<AVCapturePhotoFileDataRepresentationCustomizer>)customizer {
+    VCamLogOnce(@"photo:fileDataCustomizer", @"相机在取 fileDataRepresentationWithCustomizer");
     NSData *fake = vcamFakePhotoData();
     if (fake) return fake;
     return %orig;
 }
 - (CVPixelBufferRef)pixelBuffer {
+    VCamLogOnce(@"photo:pixelBuffer", @"相机在取 pixelBuffer");
     CVPixelBufferRef fake = vcamFakePixelBuffer();
+    if (fake) return fake;
+    return %orig;
+}
+- (CGImageRef)CGImageRepresentation {
+    VCamLogOnce(@"photo:cgImage", @"相机在取 CGImageRepresentation");
+    CGImageRef fake = vcamFakeCGImage();
     if (fake) return fake;
     return %orig;
 }
 %end
 
-// 录像替换。hook 基类 AVCaptureFileOutput，子类 AVCaptureMovieFileOutput 自然继承这个 override，
-// 系统相机的普通录像和 QuickTake 都走这里。
+// 录像替换。hook 基类 AVCaptureFileOutput，子类 AVCaptureMovieFileOutput 自然继承这个 override。
+// 实测系统相机不走这条路（日志里 startRecording 一次都没出现），留着是为了第三方 App。
 %hook AVCaptureFileOutput
 - (void)startRecordingToOutputFileURL:(NSURL *)outputFileURL
                     recordingDelegate:(id<AVCaptureFileOutputRecordingDelegate>)delegate {
     g_recordingURL = outputFileURL;
     VCamLog(@"开始录像 -> %@", outputFileURL.path);
-    vcamInstallRecordHook([delegate class]);
+    vcamInstallRecordHook(delegate);
     %orig;
 }
 - (void)stopRecording {
@@ -881,7 +1241,6 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
 %ctor {
     @autoreleasepool {
         g_pickerDelegate = [[VCamImagePickerControllerDelegate alloc] init];
-        g_allVideoDelegates = nil;
         g_selectedVideoUrl = nil;
         // weak 持有预览层，避免拦住它的释放；覆盖层由我们强持有，预览层没了就跟着回收
         g_previewLayers = [NSHashTable weakObjectsHashTable];
