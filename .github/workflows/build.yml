@@ -50,32 +50,14 @@ jobs:
         export THEOS=$HOME/theos
         export PATH=$HOME/theos/bin:$PATH
         make clean
-        # tee 一份给下面的失败步骤用（GitHub 的 bash 默认带 -eo pipefail，管道退出码仍是 make 的）
+        # 不能用 `make ... | tee`：这台 runner 的 bash 没开 pipefail，管道的退出码会变成 tee 的 0，
+        # make 失败了这一步也显示 success（上一轮就是这么被骗过去的）。所以自己捞 PIPESTATUS。
         make package FINALPACKAGE=1 2>&1 | tee /tmp/vcam-build.log
-        echo "Build complete. Packages:"
+        rc=${PIPESTATUS[0]}
+        echo "make 退出码: $rc"
         ls -lh packages/ 2>/dev/null || echo "No packages dir"
+        exit $rc
       timeout-minutes: 15
-
-    # 失败时把编译日志推到一个固定分支 ci-log。
-    # 原因：Actions 的日志要登录才能读，而开发机是 Windows / 没有 iOS SDK，
-    # 唯一能编译的就是 CI —— 不这么做，每次失败都得人工去网页上把日志贴回来。
-    # 只写 ci-log 分支（每次强推覆盖），不碰 main，也不影响 Release。
-    - name: Publish build log on failure
-      if: failure()
-      run: |
-        git config user.name "ci"
-        git config user.email "ci@users.noreply.github.com"
-        (git fetch --depth=1 origin ci-log && git checkout -B ci-log FETCH_HEAD) || git checkout -B ci-log
-        {
-          echo "# 构建失败日志 commit ${{ github.sha }}"
-          echo
-          echo '```'
-          grep -v '^[[:space:]]*$' /tmp/vcam-build.log 2>/dev/null | tail -400
-          echo '```'
-        } > ci-fail.md
-        git add -f ci-fail.md
-        git commit --allow-empty -m "ci-fail ${{ github.sha }}"
-        git push -f origin ci-log
 
     - name: Verify package control
       run: |
@@ -137,3 +119,30 @@ jobs:
           - 仅适用于 roothide 越狱（Dopamine-roothide / roothide Bootstrap）
         files: output/*.deb
         make_latest: true
+
+    # 失败时把编译日志推到一个固定分支 ci-log，本地 `git fetch origin ci-log` 就能读。
+    # 原因：Actions 的日志要登录才能看，而开发机是 Windows / 没有 iOS SDK，
+    # 唯一能编译的就是 CI —— 不这么做，每次失败都得人工去网页上把日志贴回来。
+    # 放在最后一步，任何一个环节失败都能捞到；只强推 ci-log 分支，不碰 main。
+    - name: Publish build log on failure
+      if: failure()
+      run: |
+        git config user.name "ci"
+        git config user.email "ci@users.noreply.github.com"
+        (git fetch --depth=1 origin ci-log && git checkout -B ci-log FETCH_HEAD) || git checkout -B ci-log
+        {
+          echo "# 构建失败日志 commit ${{ github.sha }}"
+          echo
+          echo '```'
+          grep -v '^[[:space:]]*$' /tmp/vcam-build.log 2>/dev/null | tail -400
+          echo '```'
+          echo
+          echo '## packages/ 目录'
+          echo
+          echo '```'
+          ls -la packages/ 2>&1
+          echo '```'
+        } > ci-fail.md
+        git add -f ci-fail.md
+        git commit --allow-empty -m "ci-fail ${{ github.sha }}"
+        git push -f origin ci-log
