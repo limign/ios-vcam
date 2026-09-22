@@ -13,7 +13,8 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = VCam
 
-VCam_FILES = Tweak.xm MediaManager.m
+# MediaManager.m 已无人引用（Tweak.xm 里搜不到 MediaManager），留着只是白编一份
+VCam_FILES = Tweak.xm
 VCam_CFLAGS = -fobjc-arc
 VCam_CXXFLAGS = -fobjc-arc -std=c++17
 VCam_LDFLAGS = -std=c++17
