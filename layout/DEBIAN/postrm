@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # 清理临时文件
-rm -f /tmp/vcam_input.mp4
+rm -f /tmp/vcam_input.mp4 2>/dev/null
 
 # 重启 SpringBoard
 if [ "$1" = "remove" ]; then
-    killall -9 SpringBoard
+    killall -9 SpringBoard 2>/dev/null
 fi
 
 exit 0

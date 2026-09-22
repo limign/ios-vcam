@@ -1,7 +1,14 @@
 ARCHS = arm64 arm64e
 TARGET := iphone:clang:latest:14.0
 INSTALL_TARGET_PROCESSES = SpringBoard
-THEOS_PACKAGE_SCHEME = rootless
+
+# 目标环境为 Dopamine-roothide / roothide Bootstrap：
+# 必须使用 roothide 打包方案，产出 Architecture: iphoneos-arm64e 的 deb，
+# 包内路径按 rootful 布局（/Library/...），安装时由 roothide 的 dpkg 自动映射进 jbroot。
+# 需要 roothide 版 theos: https://github.com/roothide/theos
+# 如需编译传统 rootless 包: make package THEOS_PACKAGE_SCHEME=rootless
+THEOS_PACKAGE_SCHEME = roothide
+
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = VCam

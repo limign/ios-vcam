@@ -22,8 +22,8 @@ jobs:
 
     - name: Install Theos
       run: |
-        export THEOS=~/theos
-        git clone --recursive https://github.com/theos/theos.git ~/theos
+        # 必须使用 roothide 版 theos，上游 theos 不支持 THEOS_PACKAGE_SCHEME=roothide
+        git clone --recursive https://github.com/roothide/theos.git ~/theos
         echo "THEOS=$HOME/theos" >> $GITHUB_ENV
         echo "PATH=$HOME/theos/bin:$PATH" >> $GITHUB_ENV
       timeout-minutes: 10
@@ -50,6 +50,19 @@ jobs:
         echo "Build complete. Packages:"
         ls -lh packages/ 2>/dev/null || echo "No packages dir"
       timeout-minutes: 15
+
+    - name: Verify package control
+      run: |
+        DEB=$(ls packages/*.deb | head -1)
+        echo "Package file: $DEB"
+        CONTROL=$(ar t "$DEB" | grep control)
+        ar p "$DEB" "$CONTROL" | tar -xzO ./control | tee /tmp/control
+        ARCH=$(awk '/^Architecture:/{print $2}' /tmp/control)
+        if [ "$ARCH" != "iphoneos-arm64e" ]; then
+          echo "::error::deb 架构为 $ARCH，roothide 设备需要 iphoneos-arm64e（请确认 THEOS_PACKAGE_SCHEME=roothide 且使用了 roothide 版 theos）"
+          exit 1
+        fi
+        echo "OK: roothide 包，架构 $ARCH"
 
     - name: Extract dylib
       run: |

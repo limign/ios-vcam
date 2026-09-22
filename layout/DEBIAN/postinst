@@ -1,10 +1,13 @@
 #!/bin/bash
 
-# 设置权限
-chmod 755 /Library/MobileSubstrate/DynamicLibraries/VCam.dylib
-chmod 644 /Library/MobileSubstrate/DynamicLibraries/VCam.plist
+# roothide 下 dpkg 会把 /Library/... 映射到 jbroot，这里的失败不应阻塞安装，
+# 因此不使用 set -e，并对每条命令做容错。
+
+LIBDIR=/Library/MobileSubstrate/DynamicLibraries
+[ -f "$LIBDIR/VCam.dylib" ] && chmod 755 "$LIBDIR/VCam.dylib" 2>/dev/null
+[ -f "$LIBDIR/VCam.plist" ] && chmod 644 "$LIBDIR/VCam.plist" 2>/dev/null
 
 # 重启 SpringBoard 加载插件
-killall -9 SpringBoard
+killall -9 SpringBoard 2>/dev/null
 
 exit 0
