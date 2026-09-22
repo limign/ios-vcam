@@ -550,9 +550,10 @@ static void vcamStartPlayerAttempt(NSString *sharedPath, NSString *playPath, int
     vcamTeardownPlayer();
 
     AVPlayerItem *item = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:playPath]];
-    // 没有 +playerWithItem: 这个类方法（上一轮 AVQueuePlayer 也是栽在这类"想当然的工厂方法"上），
-    // 直接用 alloc/init，省得再猜一次
-    AVPlayer *p = [[AVPlayer alloc] initWithItem:item];
+    // 注意是 initWithPlayerItem:（不是 initWithItem:），上一轮 AVQueuePlayer 也是栽在
+    // 这类"想当然的初始化方法"上。这里用 alloc/init 而不是 +playerWithPlayerItem:，
+    // 少绕一层类方法查找
+    AVPlayer *p = [[AVPlayer alloc] initWithPlayerItem:item];
     // 不用 AVQueuePlayer + AVPlayerLooper：实测这台设备上 looper 的两个版本
     // （空队列版、把模板塞进队列版）时钟都不走，画面定在第一帧 —— 铁证是三张
     // "假照片"字节数完全相同，说明每次取到的都是同一帧。循环自己做。
