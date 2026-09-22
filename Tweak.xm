@@ -176,6 +176,71 @@ static void vcamApplySharedState(void);
 static void vcamWriteSharedState(BOOL enabled, NSString *videoPath);
 static BOOL vcamReadSharedState(BOOL *enabled, NSString **path);
 
+#pragma mark 录像替换
+// 录像与拍照完全不同：AVCaptureMovieFileOutput 直接把编码后的数据写进 App 给的文件，
+// 中途没有我们能插手的 sample buffer，所以只能事后覆盖 —— 记住目标 URL，
+// 等录制结束、文件定型之后，把我们的视频拷过去。
+static NSURL *g_recordingURL = nil;
+static NSMutableDictionary *g_recordOrigIMPs = nil;   // 代理类名 -> 原 IMP
+
+// 把录下来的文件换成我们的视频。重复调用无害（目标已存在就先删再拷），
+// 失败只记日志不抛，绝不能影响录像本身。
+static void vcamReplaceRecordedFile(NSURL *url) {
+    if (!g_vcamEnabled || g_playingPath.length == 0 || url.path.length == 0) return;
+
+    NSError *err = nil;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([fm fileExistsAtPath:url.path]) {
+        [fm removeItemAtPath:url.path error:NULL];
+    }
+    if ([fm copyItemAtPath:g_playingPath toPath:url.path error:&err]) {
+        VCamLog(@"录像替换生效：%@ <- %@", url.path, g_playingPath);
+    } else {
+        VCamLog(@"录像替换失败：%@", err.localizedDescription);
+    }
+}
+
+// 代理的 didFinishRecording 回调 —— 此时文件已定型，是替换的安全时机
+static void vcamDidFinishRecording(id self, SEL _cmd, AVCaptureFileOutput *output,
+                                   NSURL *outputFileURL, AVCaptureConnection *connection,
+                                   NSError *error) {
+    vcamReplaceRecordedFile(outputFileURL);
+
+    Class cls = object_getClass(self);
+    IMP orig = NULL;
+    while (cls && !orig) {
+        orig = [g_recordOrigIMPs[NSStringFromClass(cls)] pointerValue];
+        cls = class_getSuperclass(cls);
+    }
+    if (orig) {
+        ((void (*)(id, SEL, AVCaptureFileOutput *, NSURL *, AVCaptureConnection *, NSError *))orig)(
+            self, _cmd, output, outputFileURL, connection, error);
+    }
+}
+
+// 给录像代理的类装上回调 hook。代理类由 App 决定且事先不可知，
+// 只能在 startRecording 时按实际对象动态安装。
+static void vcamInstallRecordHook(Class cls) {
+    if (!cls) return;
+    if (!g_recordOrigIMPs) g_recordOrigIMPs = [NSMutableDictionary dictionary];
+
+    NSString *key = NSStringFromClass(cls);
+    if (g_recordOrigIMPs[key]) return;
+
+    SEL sel = @selector(captureOutput:didFinishRecordingToOutputFileAtURL:fromConnection:error:);
+    if (!class_getInstanceMethod(cls, sel)) {
+        VCamLog(@"录像代理 %@ 没实现 didFinishRecording，跳过 hook", key);
+        return;
+    }
+
+    IMP orig = NULL;
+    MSHookMessageEx(cls, sel, (IMP)vcamDidFinishRecording, &orig);
+    if (orig) {
+        g_recordOrigIMPs[key] = [NSValue valueWithPointer:orig];
+        VCamLog(@"已给录像代理 %@ 装上 didFinishRecording hook", key);
+    }
+}
+
 #pragma mark 预览层覆盖
 // 正在同步的标记：addSublayer / 改 frame 都会让父层重新 layout，
 // 进而再次回调 layoutSublayers，没有这个闩就会递归。
@@ -729,6 +794,28 @@ static void handleTapGesture(UITapGestureRecognizer *gesture) {
     CVPixelBufferRef fake = vcamFakePixelBuffer();
     if (fake) return fake;
     return %orig;
+}
+%end
+
+// 录像替换。hook 基类 AVCaptureFileOutput，子类 AVCaptureMovieFileOutput 自然继承这个 override，
+// 系统相机的普通录像和 QuickTake 都走这里。
+%hook AVCaptureFileOutput
+- (void)startRecordingToOutputFileURL:(NSURL *)outputFileURL
+                    recordingDelegate:(id<AVCaptureFileOutputRecordingDelegate>)delegate {
+    g_recordingURL = outputFileURL;
+    VCamLog(@"开始录像 -> %@", outputFileURL.path);
+    vcamInstallRecordHook([delegate class]);
+    %orig;
+}
+- (void)stopRecording {
+    %orig;
+    // 兜底：万一代理回调没装上，等文件定型后再补一次替换。
+    // 重复替换无害，代价只是多拷一次文件。
+    NSURL *target = g_recordingURL;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        vcamReplaceRecordedFile(target);
+    });
 }
 %end
 
