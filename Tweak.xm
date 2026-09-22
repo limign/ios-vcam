@@ -629,49 +629,68 @@ static void vcamPlayerWatchdog(void) {
 // 读轨道必须用 iOS15+ 的异步接口：同步的 tracksWithMediaType: 在 17.5 SDK 里已废弃，
 // 开着 -Werror 会直接卡构建。它在别的线程回调，所以这里只组装，起播放器要回主线程。
 // 任何一步不成就退回"按原文件播"，绝不因为这一步做不成而没有画面。
+//
+// 必须写成 @available 分支：Makefile 的部署目标还是 14.0，直接用 iOS15 的接口会撞上
+// -Wunguarded-availability-new（这一条已经让 CI 挂过一次，CI 原话：
+// "'loadTracksWithMediaType:completionHandler:' is only available on iOS 15.0 or newer"）。
+// 本包实际只跑 iOS 15+（roothide/Dopamine 的要求），else 分支只是为了让编译器满意。
 static void vcamMakeVideoOnlyItem(NSURL *url, void (^done)(AVPlayerItem *item, NSString *note)) {
-    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:nil];
-    [asset loadTracksWithMediaType:AVMediaTypeVideo
-                 completionHandler:^(NSArray<AVAssetTrack *> * _Nullable tracks,
-                                     NSError * _Nullable error) {
-        AVPlayerItem *item = nil;
-        NSString *note = nil;
-        AVAssetTrack *vt = tracks.firstObject;
-        AVMutableComposition *comp = nil;
+    if (@available(iOS 15.0, *)) {
+        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:nil];
+        [asset loadTracksWithMediaType:AVMediaTypeVideo
+                     completionHandler:^(NSArray<AVAssetTrack *> * _Nullable tracks,
+                                         NSError * _Nullable error) {
+            AVPlayerItem *item = nil;
+            NSString *note = nil;
+            AVAssetTrack *vt = tracks.firstObject;
+            AVMutableComposition *comp = nil;
 
-        if (vt) {
-            comp = [AVMutableComposition composition];
-            AVMutableCompositionTrack *ct =
-                [comp addMutableTrackWithMediaType:AVMediaTypeVideo
-                                preferredTrackID:kCMPersistentTrackID_Invalid];
-            NSError *e = nil;
-            // 时长取轨道自己的 timeRange（不用 AVAsset.duration，那个在 17.5 里已废弃）
-            if (ct && [ct insertTimeRange:CMTimeRangeMake(kCMTimeZero, vt.timeRange.duration)
-                                  ofTrack:vt atTime:kCMTimeZero error:&e]) {
-                // 构图轨道不会自动继承原轨道的方向信息（竖屏视频常靠 preferredTransform
-                // 摆正）。漏了这行，本来竖着拍的视频会被摆横。
-                // 用 KVC 取这个结构体属性：万一它在 17.5 SDK 里被标了废弃，直接写属性名
-                // 就会卡构建，而 KVC 取不到只是少一次摆正，不会崩。
-                id tf = vcamValueIfResponds(vt, @selector(preferredTransform));
-                if ([tf isKindOfClass:[NSValue class]]) {
-                    ct.preferredTransform = [(NSValue *)tf CGAffineTransformValue];
+            // 这一段用的 AVAssetTrack.timeRange / AVMutableCompositionTrack 几个接口在 iOS 16
+            // 之后被 Apple 陆续标过废弃（换成异步 load 系列），而本机没有 iOS SDK、唯一的编译器
+            // 就是 CI，赌"它没被标废弃"的成本是一轮构建。这里窄范围屏蔽掉废弃警告：
+            // 真被废弃也只是"将来会移除"，功能照旧，而且每条路径失败都有退回"按原文件播"的兜底。
+            // 注意这只屏蔽废弃警告，可用性（-Wunguarded-availability-new）不在此列，那个由上面的
+            // @available 负责 —— 别把两种警告混起来看。
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            if (vt) {
+                comp = [AVMutableComposition composition];
+                AVMutableCompositionTrack *ct =
+                    [comp addMutableTrackWithMediaType:AVMediaTypeVideo
+                                    preferredTrackID:kCMPersistentTrackID_Invalid];
+                NSError *e = nil;
+                // 时长取轨道自己的 timeRange（不用 AVAsset.duration，那个在 17.5 里已废弃）
+                if (ct && [ct insertTimeRange:CMTimeRangeMake(kCMTimeZero, vt.timeRange.duration)
+                                      ofTrack:vt atTime:kCMTimeZero error:&e]) {
+                    // 构图轨道不会自动继承原轨道的方向信息（竖屏视频常靠 preferredTransform
+                    // 摆正）。漏了这行，本来竖着拍的视频会被摆横。
+                    // 用 KVC 取这个结构体属性：万一它在 17.5 SDK 里被标了废弃，直接写属性名
+                    // 就会卡构建，而 KVC 取不到只是少一次摆正，不会崩。
+                    id tf = vcamValueIfResponds(vt, @selector(preferredTransform));
+                    if ([tf isKindOfClass:[NSValue class]]) {
+                        ct.preferredTransform = [(NSValue *)tf CGAffineTransformValue];
+                    } else {
+                        VCamLog(@"取不到原视频的方向信息，按不旋转播放");
+                    }
+                    item = [AVPlayerItem playerItemWithAsset:comp];
+                    note = @"已剥掉音轨（不让播放器碰音频会话）";
                 } else {
-                    VCamLog(@"取不到原视频的方向信息，按不旋转播放");
+                    note = [NSString stringWithFormat:@"音轨剥离失败（%@），按原文件播",
+                            e.localizedDescription ?: @"?"];
                 }
-                item = [AVPlayerItem playerItemWithAsset:comp];
-                note = @"已剥掉音轨（不让播放器碰音频会话）";
             } else {
-                note = [NSString stringWithFormat:@"音轨剥离失败（%@），按原文件播",
-                        e.localizedDescription ?: @"?"];
+                note = [NSString stringWithFormat:@"没读到视频轨（%@），按原文件播",
+                        error.localizedDescription ?: @"?"];
             }
-        } else {
-            note = [NSString stringWithFormat:@"没读到视频轨（%@），按原文件播",
-                    error.localizedDescription ?: @"?"];
-        }
+#pragma clang diagnostic pop
 
-        if (!item) item = [AVPlayerItem playerItemWithURL:url];
-        dispatch_async(dispatch_get_main_queue(), ^{ done(item, note); });
-    }];
+            if (!item) item = [AVPlayerItem playerItemWithURL:url];
+            dispatch_async(dispatch_get_main_queue(), ^{ done(item, note); });
+        }];
+        return;
+    }
+
+    done([AVPlayerItem playerItemWithURL:url], @"系统低于 iOS 15，按原文件播");
 }
 
 static void vcamStartPlayerAttempt(NSString *sharedPath, NSString *playPath, int attempt);
